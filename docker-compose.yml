@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: finops
+      # NOT VALID — local test data only
+      POSTGRES_PASSWORD: NU_TEST_finops
+      POSTGRES_DB: finops
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finops"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  localstack:
+    image: localstack/localstack:3.8
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+    ports:
+      - "4566:4566"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev --import-realm --hostname-strict=false
+    environment:
+      KEYCLOAK_ADMIN: admin
+      # NOT VALID — local test data only
+      KEYCLOAK_ADMIN_PASSWORD: NU_TEST_admin
+    volumes:
+      - ./deploy/keycloak:/opt/keycloak/data/import
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8080'"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+  api:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    environment:
+      HTTP_ADDR: ":8080"
+      DATABASE_HOST: postgres
+      DATABASE_PORT: "5432"
+      DATABASE_USER: finops
+      DATABASE_PASSWORD: NU_TEST_finops
+      DATABASE_NAME: finops
+      DATABASE_SSLMODE: disable
+      AWS_REGION: us-east-1
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_ACCESS_KEY_ID: NU_TEST_localstack
+      AWS_SECRET_ACCESS_KEY: NU_TEST_localstack
+      OIDC_ISSUER: http://keycloak:8080/realms/finops
+      OIDC_AUDIENCE: finops-api
+      INTERNAL_CLIENT_ID: wallet-internal
+      INSTANCE_ID: api-1
+    ports:
+      - "8080:8080"
