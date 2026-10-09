@@ -1,0 +1,30 @@
+package domain
+
+import "errors"
+
+var (
+	ErrWalletNotFound            = errors.New("wallet not found")
+	ErrTransactionNotFound       = errors.New("transaction not found")
+	ErrWalletConflict            = errors.New("wallet already exists for player and currency")
+	ErrInsufficientFunds         = errors.New("insufficient funds")
+	ErrInsufficientFundsReversal = errors.New("insufficient funds for reversal")
+	ErrInvalidKind               = errors.New("invalid transaction kind")
+	ErrOpeningNotAllowed         = errors.New("OPENING is not allowed on external channels")
+	ErrInvalidAmount             = errors.New("invalid amount for operation kind")
+	ErrCurrencyMismatch          = errors.New("operation currency does not match wallet")
+	ErrIdempotencyConflict       = errors.New("idempotency key reused with different payload")
+	ErrExternalIDConflict        = errors.New("external transaction already exists with a different idempotency key")
+	ErrInvalidStateTransition    = errors.New("invalid state transition")
+	ErrTerminalTransaction       = errors.New("transaction is terminal")
+	ErrReferenceRequired         = errors.New("referenceExternalTransactionId is required")
+	ErrReferenceNotFound         = errors.New("referenced transaction not found")
+	ErrReferenceNotProcessed     = errors.New("referenced transaction is not processed")
+	ErrReferenceMismatch         = errors.New("referenced transaction does not match provider, player, wallet, currency or round")
+	ErrDuplicateReversal         = errors.New("reference already has a successful reversal of this kind")
+	ErrUnauthorizedProvider      = errors.New("authenticated provider cannot access this resource")
+	ErrUnauthorizedInternal      = errors.New("internal operation requires the wallet service identity")
+	ErrInvalidIdempotencyKey     = errors.New("idempotency key is required")
+	ErrUninitialized             = errors.New("uninitialized domain value")
+	ErrLedgerInvariant           = errors.New("ledger invariant violated")
+	ErrPayloadConflict           = errors.New("payload hash mismatch")
+)

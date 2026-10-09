@@ -1,0 +1,6 @@
+/api
+/bin
+*.exe
+.DS_Store
+.env
+coverage.out
