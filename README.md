@@ -50,13 +50,13 @@ O SQL fica em `internal/adapter/postgres/migrations` (embutido no binário).
 
 | client            | secret                 | papel                              |
 |-------------------|------------------------|------------------------------------|
-| `provider-a`      | `NU_TEST_provider-a`      | provedor `provider-a`              |
-| `provider-b`      | `NU_TEST_provider-b`      | provedor `provider-b`              |
-| `wallet-internal` | `NU_TEST_wallet-internal` | carteiras, ledger, reconciliação   |
+| `provider-a`      | `dummy_provider-a`      | provedor `provider-a`              |
+| `provider-b`      | `dummy_provider-b`      | provedor `provider-b`              |
+| `wallet-internal` | `dummy_wallet-internal` | carteiras, ledger, reconciliação   |
 
 ```sh
 TOKEN=$(curl -s -X POST http://localhost:8081/realms/finops/protocol/openid-connect/token \
-  -d grant_type=client_credentials -d client_id=wallet-internal -d client_secret=NU_TEST_wallet-internal \
+  -d grant_type=client_credentials -d client_id=wallet-internal -d client_secret=dummy_wallet-internal \
   | jq -r .access_token)
 
 curl -s -X POST http://localhost:8080/wallets \
@@ -68,7 +68,7 @@ Aposta de provedor:
 
 ```sh
 PTOKEN=$(curl -s -X POST http://localhost:8081/realms/finops/protocol/openid-connect/token \
-  -d grant_type=client_credentials -d client_id=provider-a -d client_secret=NU_TEST_provider-a \
+  -d grant_type=client_credentials -d client_id=provider-a -d client_secret=dummy_provider-a \
   | jq -r .access_token)
 
 curl -s -X POST http://localhost:8080/wagering/transactions \

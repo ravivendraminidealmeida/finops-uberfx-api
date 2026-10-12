@@ -35,9 +35,9 @@ func TestHTTPAuthenticatedFlow(t *testing.T) {
 	api := httptest.NewServer(httpapi.NewServer(svc, verifier, func(context.Context) error { return nil }, obs.NewMetrics(), zap.NewNop()).Router())
 	t.Cleanup(api.Close)
 
-	internalTok := clientToken(t, issuer, "wallet-internal", "NU_TEST_wallet-internal")
-	providerA := clientToken(t, issuer, "provider-a", "NU_TEST_provider-a")
-	providerB := clientToken(t, issuer, "provider-b", "NU_TEST_provider-b")
+	internalTok := clientToken(t, issuer, "wallet-internal", "dummy_wallet-internal")
+	providerA := clientToken(t, issuer, "provider-a", "dummy_provider-a")
+	providerB := clientToken(t, issuer, "provider-b", "dummy_provider-b")
 
 	playerID := uuid.NewString()
 	openBody, _ := json.Marshal(map[string]any{

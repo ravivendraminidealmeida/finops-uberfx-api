@@ -3,7 +3,7 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: finops
-      POSTGRES_PASSWORD: NU_TEST_finops # NOT VALID — test data only
+      POSTGRES_PASSWORD: dummy_finops # NOT VALID — test data only
       POSTGRES_DB: finops
     ports:
       - "5432:5432"
@@ -31,7 +31,7 @@ services:
     command: start-dev --import-realm --hostname-strict=false
     environment:
       KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: NU_TEST_admin # NOT VALID — test data only
+      KEYCLOAK_ADMIN_PASSWORD: dummy_admin # NOT VALID — test data only
     volumes:
       - ./deploy/keycloak:/opt/keycloak/data/import
     ports:
@@ -57,7 +57,7 @@ services:
       DATABASE_HOST: postgres
       DATABASE_PORT: "5432"
       DATABASE_USER: finops
-      DATABASE_PASSWORD: NU_TEST_finops # NOT VALID — test data only
+      DATABASE_PASSWORD: dummy_finops # NOT VALID — test data only
       DATABASE_NAME: finops
       DATABASE_SSLMODE: disable
       AWS_REGION: us-east-1
