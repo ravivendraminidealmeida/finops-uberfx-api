@@ -29,40 +29,56 @@ type Config struct {
 }
 
 func Load() (Config, error) {
-	dsn, err := databaseURL()
+	dsn, err := DatabaseURL()
 	if err != nil {
 		return Config{}, err
 	}
-	cfg := Config{
+	awsKey := os.Getenv("AWS_ACCESS_KEY_ID")
+	awsSecret := os.Getenv("AWS_SECRET_ACCESS_KEY")
+	if awsKey == "" || awsSecret == "" {
+		return Config{}, fmt.Errorf("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are required")
+	}
+	issuer := os.Getenv("OIDC_ISSUER")
+	if issuer == "" {
+		return Config{}, fmt.Errorf("OIDC_ISSUER is required")
+	}
+	instance := os.Getenv("INSTANCE_ID")
+	if instance == "" {
+		host, err := os.Hostname()
+		if err != nil || host == "" {
+			host = "local"
+		}
+		instance = host
+	}
+	return Config{
 		HTTPAddr:             env("HTTP_ADDR", ":8080"),
 		DatabaseURL:          dsn,
 		AWSRegion:            env("AWS_REGION", "us-east-1"),
-		AWSEndpoint:          env("AWS_ENDPOINT_URL", "http://localhost:4566"),
-		AWSAccessKey:         env("AWS_ACCESS_KEY_ID", "NU_TEST_localstack"),
-		AWSSecretKey:         env("AWS_SECRET_ACCESS_KEY", "NU_TEST_localstack"),
+		AWSEndpoint:          os.Getenv("AWS_ENDPOINT_URL"),
+		AWSAccessKey:         awsKey,
+		AWSSecretKey:         awsSecret,
 		WagerQueueName:       env("WAGER_QUEUE_NAME", "wager-transactions.fifo"),
 		DLQName:              env("WAGER_DLQ_NAME", "wager-transactions-dlq.fifo"),
 		EventsQueueName:      env("EVENTS_QUEUE_NAME", "domain-events.fifo"),
-		OIDCIssuer:           env("OIDC_ISSUER", "http://localhost:8081/realms/finops"),
+		OIDCIssuer:           issuer,
 		OIDCAudience:         env("OIDC_AUDIENCE", "finops-api"),
 		InternalClientID:     env("INTERNAL_CLIENT_ID", "wallet-internal"),
 		MaxReferenceAttempts: envInt("PENDING_REF_MAX_ATTEMPTS", 8),
-		ReferenceBackoff:     time.Duration(envInt("PENDING_REF_BACKOFF_MS", 1000)) * time.Millisecond,
+		ReferenceBackoff:     time.Duration(envInt("PENDING_REF_BACKOFF_MS", 200)) * time.Millisecond,
 		ShutdownTimeout:      time.Duration(envInt("SHUTDOWN_TIMEOUT_SEC", 15)) * time.Second,
-		InstanceID:           env("INSTANCE_ID", "local"),
-	}
-	if cfg.OIDCIssuer == "" {
-		return Config{}, fmt.Errorf("OIDC_ISSUER is required")
-	}
-	return cfg, nil
+		InstanceID:           instance,
+	}, nil
 }
 
-func databaseURL() (string, error) {
+func DatabaseURL() (string, error) {
 	if v := os.Getenv("DATABASE_URL"); v != "" {
 		return v, nil
 	}
 	user := env("DATABASE_USER", "finops")
-	pass := env("DATABASE_PASSWORD", "NU_TEST_finops") // NOT VALID — test data only
+	pass := os.Getenv("DATABASE_PASSWORD")
+	if pass == "" {
+		return "", fmt.Errorf("DATABASE_URL or DATABASE_PASSWORD is required")
+	}
 	host := env("DATABASE_HOST", "localhost")
 	port := env("DATABASE_PORT", "5432")
 	name := env("DATABASE_NAME", "finops")

@@ -43,13 +43,13 @@ CREATE TABLE wager_transactions (
 CREATE UNIQUE INDEX wager_external_id_uq ON wager_transactions (provider_id, external_transaction_id)
     WHERE origin = 'EXTERNAL';
 
-CREATE UNIQUE INDEX wager_idempotency_uq ON wager_transactions (idempotency_key)
+CREATE UNIQUE INDEX wager_idempotency_uq ON wager_transactions (provider_id, idempotency_key)
     WHERE idempotency_key IS NOT NULL;
 
 CREATE UNIQUE INDEX wager_opening_uq ON wager_transactions (wallet_id)
     WHERE kind = 'OPENING';
 
-CREATE UNIQUE INDEX wager_active_reversal_uq ON wager_transactions (referenced_transaction_id, kind)
+CREATE UNIQUE INDEX wager_active_reversal_uq ON wager_transactions (referenced_transaction_id)
     WHERE kind IN ('REFUND', 'ROLLBACK')
       AND referenced_transaction_id IS NOT NULL
       AND status IN ('PENDING', 'PENDING_REFERENCE', 'PROCESSED');
@@ -102,6 +102,7 @@ CREATE TABLE outbox (
     event_type TEXT NOT NULL,
     aggregate_id UUID NOT NULL,
     payload JSONB NOT NULL,
+    message_group_id TEXT NOT NULL DEFAULT '',
     occurred_at TIMESTAMPTZ NOT NULL,
     attempts INT NOT NULL DEFAULT 0,
     next_attempt_at TIMESTAMPTZ NOT NULL,

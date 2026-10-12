@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -16,13 +15,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
 	"go.uber.org/zap"
 
+	"junglegaming.io/finops-api/internal/adapter/wire"
 	"junglegaming.io/finops-api/internal/app"
-	"junglegaming.io/finops-api/internal/domain"
-	"junglegaming.io/finops-api/internal/domain/idemp"
-	"junglegaming.io/finops-api/internal/domain/money"
 	"junglegaming.io/finops-api/internal/domain/wager"
 	"junglegaming.io/finops-api/internal/domain/wallet"
 	"junglegaming.io/finops-api/internal/platform/config"
+	"junglegaming.io/finops-api/internal/platform/obs"
 )
 
 const ConsumerName = "wager-transactions-consumer"
@@ -30,19 +28,17 @@ const ConsumerName = "wager-transactions-consumer"
 type Client struct {
 	api           *sqs.Client
 	wagerQueueURL string
-	eventsURL     string
 	dlqURL        string
+	eventsURL     string
+	waitSeconds   int32
+	visibility    int32
 }
 
 func NewClient(ctx context.Context, cfg config.Config) (*Client, error) {
-	loadOpts := []func(*awsconfig.LoadOptions) error{
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(cfg.AWSRegion),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(cfg.AWSAccessKey, cfg.AWSSecretKey, "")),
-	}
-	if cfg.AWSEndpoint != "" {
-		loadOpts = append(loadOpts, awsconfig.WithBaseEndpoint(cfg.AWSEndpoint))
-	}
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -51,7 +47,7 @@ func NewClient(ctx context.Context, cfg config.Config) (*Client, error) {
 			o.BaseEndpoint = aws.String(cfg.AWSEndpoint)
 		}
 	})
-	c := &Client{api: api}
+	c := &Client{api: api, waitSeconds: 10, visibility: 60}
 	c.wagerQueueURL, err = ensureFIFO(ctx, api, cfg.WagerQueueName, cfg.DLQName)
 	if err != nil {
 		return nil, err
@@ -67,6 +63,11 @@ func NewClient(ctx context.Context, cfg config.Config) (*Client, error) {
 	return c, nil
 }
 
+func (c *Client) SetReceiveOptions(wait, visibility int32) {
+	c.waitSeconds = wait
+	c.visibility = visibility
+}
+
 func (c *Client) Ready(ctx context.Context) error {
 	_, err := c.api.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{
 		QueueUrl: aws.String(c.wagerQueueURL),
@@ -77,26 +78,12 @@ func (c *Client) Ready(ctx context.Context) error {
 	return err
 }
 
-func (c *Client) Publish(ctx context.Context, body []byte) error {
-	var env struct {
-		EventID     string `json:"eventId"`
-		AggregateID string `json:"aggregateId"`
-	}
-	_ = json.Unmarshal(body, &env)
-	group := env.AggregateID
-	if group == "" {
-		group = "default"
-	}
-	dedup := env.EventID
-	if dedup == "" {
-		sum := sha256.Sum256(body)
-		dedup = hex.EncodeToString(sum[:])
-	}
+func (c *Client) Publish(ctx context.Context, groupID, eventID string, body []byte) error {
 	_, err := c.api.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl:               aws.String(c.eventsURL),
 		MessageBody:            aws.String(string(body)),
-		MessageGroupId:         aws.String(group),
-		MessageDeduplicationId: aws.String(dedup),
+		MessageGroupId:         aws.String(groupID),
+		MessageDeduplicationId: aws.String(eventID),
 	})
 	return err
 }
@@ -105,8 +92,8 @@ func (c *Client) Receive(ctx context.Context, max int32) ([]types.Message, error
 	out, err := c.api.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
 		QueueUrl:            aws.String(c.wagerQueueURL),
 		MaxNumberOfMessages: max,
-		WaitTimeSeconds:     10,
-		VisibilityTimeout:   60,
+		WaitTimeSeconds:     c.waitSeconds,
+		VisibilityTimeout:   c.visibility,
 		MessageSystemAttributeNames: []types.MessageSystemAttributeName{
 			types.MessageSystemAttributeNameMessageGroupId,
 		},
@@ -125,6 +112,32 @@ func (c *Client) Delete(ctx context.Context, receipt string) error {
 	return err
 }
 
+func (c *Client) ReceiveEvents(ctx context.Context) ([]types.Message, error) {
+	out, err := c.api.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+		QueueUrl:            aws.String(c.eventsURL),
+		MaxNumberOfMessages: 10,
+		WaitTimeSeconds:     1,
+		VisibilityTimeout:   30,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out.Messages, nil
+}
+
+func (c *Client) ReceiveDLQ(ctx context.Context) ([]types.Message, error) {
+	out, err := c.api.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+		QueueUrl:            aws.String(c.dlqURL),
+		MaxNumberOfMessages: 10,
+		WaitTimeSeconds:     1,
+		VisibilityTimeout:   30,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out.Messages, nil
+}
+
 func (c *Client) SendWager(ctx context.Context, body []byte, group, dedup string) error {
 	_, err := c.api.SendMessage(ctx, &sqs.SendMessageInput{
 		QueueUrl:               aws.String(c.wagerQueueURL),
@@ -136,13 +149,14 @@ func (c *Client) SendWager(ctx context.Context, body []byte, group, dedup string
 }
 
 type Consumer struct {
-	client *Client
-	svc    *app.Service
-	log    *zap.Logger
+	client  *Client
+	svc     *app.Service
+	log     *zap.Logger
+	metrics *obs.Metrics
 }
 
-func NewConsumer(client *Client, svc *app.Service, log *zap.Logger) *Consumer {
-	return &Consumer{client: client, svc: svc, log: log}
+func NewConsumer(client *Client, svc *app.Service, log *zap.Logger, metrics *obs.Metrics) *Consumer {
+	return &Consumer{client: client, svc: svc, log: log, metrics: metrics}
 }
 
 func (c *Consumer) Run(ctx context.Context) error {
@@ -179,27 +193,25 @@ type inboundEnvelope struct {
 }
 
 type inboundData struct {
-	ProviderID            string `json:"providerId"`
-	ExternalTransactionID string `json:"externalTransactionId"`
-	IdempotencyKey        string `json:"idempotencyKey"`
-	PlayerID              string `json:"playerId"`
-	WalletID              string `json:"walletId"`
-	RoundID               string `json:"roundId"`
-	GameID                string `json:"gameId"`
-	Kind                  string `json:"kind"`
-	Money                 struct {
-		Amount   string `json:"amount"`
-		Currency string `json:"currency"`
-	} `json:"money"`
-	ReferenceExternalID string `json:"referenceExternalTransactionId"`
+	ProviderID            string     `json:"providerId"`
+	ExternalTransactionID string     `json:"externalTransactionId"`
+	IdempotencyKey        string     `json:"idempotencyKey"`
+	PlayerID              string     `json:"playerId"`
+	WalletID              string     `json:"walletId"`
+	RoundID               string     `json:"roundId"`
+	GameID                string     `json:"gameId"`
+	Kind                  string     `json:"kind"`
+	Money                 wire.Money `json:"money"`
+	ReferenceExternalID   string     `json:"referenceExternalTransactionId"`
 }
 
 func (c *Consumer) handle(ctx context.Context, m types.Message) error {
 	body := aws.ToString(m.Body)
 	var env inboundEnvelope
 	if err := json.Unmarshal([]byte(body), &env); err != nil {
-		c.log.Error("invalid envelope", zap.Error(err))
-		return c.client.Delete(ctx, aws.ToString(m.ReceiptHandle))
+		c.metrics.DLQ.Inc()
+		c.log.Error("invalid envelope left for redrive", zap.Error(err), zap.String("messageId", aws.ToString(m.MessageId)))
+		return err
 	}
 	msgID := env.MessageID
 	if msgID == "" {
@@ -210,24 +222,21 @@ func (c *Consumer) handle(ctx context.Context, m types.Message) error {
 
 	var data inboundData
 	if err := json.Unmarshal(env.Data, &data); err != nil {
-		return c.client.Delete(ctx, aws.ToString(m.ReceiptHandle))
-	}
-	amt, err := money.Parse(data.Money.Amount, data.Money.Currency)
-	if err != nil {
-		return c.client.Delete(ctx, aws.ToString(m.ReceiptHandle))
-	}
-	kind, err := wager.ParseKind(data.Kind)
-	if err != nil || kind == wager.KindOpening {
-		return c.client.Delete(ctx, aws.ToString(m.ReceiptHandle))
-	}
-	bizHash, err := idemp.CanonicalHash(idemp.BusinessFields(
-		data.ProviderID, data.ExternalTransactionID, data.PlayerID, data.WalletID,
-		data.RoundID, data.GameID, data.Kind, amt.DecimalString(), amt.Currency(), data.ReferenceExternalID,
-	))
-	if err != nil {
+		c.metrics.DLQ.Inc()
+		c.log.Error("invalid payload left for redrive", zap.Error(err), zap.String("messageId", msgID))
 		return err
 	}
-	_, err = c.svc.ProcessWager(ctx, app.ProcessWagerCommand{
+	amt, err := data.Money.Money()
+	if err != nil {
+		c.metrics.DLQ.Inc()
+		return err
+	}
+	kind, err := wager.ParseKind(data.Kind)
+	if err != nil {
+		c.metrics.DLQ.Inc()
+		return err
+	}
+	cmd := app.ProcessWagerCommand{
 		ProviderID:            data.ProviderID,
 		ExternalTransactionID: data.ExternalTransactionID,
 		IdempotencyKey:        data.IdempotencyKey,
@@ -238,94 +247,129 @@ func (c *Consumer) handle(ctx context.Context, m types.Message) error {
 		Kind:                  kind,
 		Amount:                amt,
 		ReferenceExternalID:   data.ReferenceExternalID,
-		PayloadHash:           bizHash,
-		CorrelationID:         msgID,
 		AuthenticatedProvider: data.ProviderID,
 		Inbox: &app.InboxMeta{
 			ConsumerName: ConsumerName,
 			MessageID:    msgID,
 			PayloadHash:  payloadHash,
 		},
-	})
+	}
+	started := time.Now()
+	res, err := c.svc.ProcessWager(ctx, cmd)
+	c.metrics.ProcessingSeconds.Observe(time.Since(started).Seconds())
 	if err != nil {
-		if isPermanent(err) {
-			_ = c.client.Delete(ctx, aws.ToString(m.ReceiptHandle))
-			return err
-		}
+		c.metrics.Retries.Inc()
+		c.log.Warn("sqs wager failed; message kept for retry/DLQ",
+			zap.Error(err),
+			zap.String("messageId", msgID),
+			zap.String("walletId", data.WalletID),
+			zap.String("providerId", data.ProviderID),
+		)
 		return err
 	}
+	c.metrics.Results.WithLabelValues(string(res.Transaction.Status()), string(res.Transaction.Kind())).Inc()
+	if res.IdempotentReplay {
+		c.metrics.Duplicates.Inc()
+	}
+	c.log.Info("sqs wager processed",
+		zap.String("messageId", msgID),
+		zap.String("correlationId", string(res.Transaction.ID())),
+		zap.String("transactionId", string(res.Transaction.ID())),
+		zap.String("walletId", data.WalletID),
+		zap.String("providerId", data.ProviderID),
+	)
 	return c.client.Delete(ctx, aws.ToString(m.ReceiptHandle))
-}
-
-func isPermanent(err error) bool {
-	return errors.Is(err, domain.ErrOpeningNotAllowed) ||
-		errors.Is(err, domain.ErrInvalidKind) ||
-		errors.Is(err, domain.ErrInvalidAmount) ||
-		errors.Is(err, domain.ErrInvalidIdempotencyKey)
 }
 
 type Publisher struct {
 	uow        app.UnitOfWork
 	client     *Client
 	instanceID string
+	clock      app.Clock
 	log        *zap.Logger
+	metrics    *obs.Metrics
 }
 
-func NewPublisher(uow app.UnitOfWork, client *Client, instanceID string, log *zap.Logger) *Publisher {
-	return &Publisher{uow: uow, client: client, instanceID: instanceID, log: log}
+func NewPublisher(uow app.UnitOfWork, client *Client, instanceID string, clock app.Clock, log *zap.Logger, metrics *obs.Metrics) *Publisher {
+	return &Publisher{uow: uow, client: client, instanceID: instanceID, clock: clock, log: log, metrics: metrics}
 }
 
 func (p *Publisher) Run(ctx context.Context) error {
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
+	delay := 200 * time.Millisecond
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
-			if err := p.tick(ctx); err != nil && ctx.Err() == nil {
+		case <-time.After(delay):
+			n, err := p.tick(ctx)
+			if err != nil && ctx.Err() == nil {
 				p.log.Warn("outbox tick failed", zap.Error(err))
+			}
+			if n == 0 {
+				delay *= 2
+				if delay > 2*time.Second {
+					delay = 2 * time.Second
+				}
+			} else {
+				delay = 200 * time.Millisecond
 			}
 		}
 	}
 }
 
-func (p *Publisher) tick(ctx context.Context) error {
+func (p *Publisher) tick(ctx context.Context) (int, error) {
+	now := p.clock.Now()
 	tx, err := p.uow.Begin(ctx)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	recs, err := tx.Outbox().Claim(ctx, p.instanceID, 30*time.Second, 20, time.Now().UTC())
+	recs, err := tx.Outbox().Claim(ctx, p.instanceID, 30*time.Second, 20, now)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return err
+		return 0, err
+	}
+	var published []string
+	if len(recs) > 0 {
+		lag := now.Sub(recs[0].OccurredAt).Seconds()
+		if lag < 0 {
+			lag = 0
+		}
+		p.metrics.OutboxLagSeconds.Set(lag)
 	}
 	for _, rec := range recs {
-		if err := p.client.Publish(ctx, rec.Payload); err != nil {
+		if err := p.client.Publish(ctx, rec.GroupID, rec.EventID, rec.Payload); err != nil {
 			rtx, berr := p.uow.Begin(ctx)
 			if berr != nil {
-				return berr
+				return len(published), berr
 			}
-			_ = rtx.Outbox().Retry(ctx, rec.ID, rec.Attempts, time.Now().UTC().Add(time.Duration(rec.Attempts)*time.Second))
-			_ = rtx.Commit(ctx)
+			if rerr := rtx.Outbox().Retry(ctx, rec.ID, rec.Attempts, now.Add(time.Duration(rec.Attempts)*time.Second)); rerr != nil {
+				_ = rtx.Rollback(ctx)
+				return len(published), rerr
+			}
+			if err := rtx.Commit(ctx); err != nil {
+				return len(published), err
+			}
 			continue
 		}
+		published = append(published, rec.ID)
+	}
+	if len(published) > 0 {
 		rtx, berr := p.uow.Begin(ctx)
 		if berr != nil {
-			return berr
+			return 0, berr
 		}
-		if err := rtx.Outbox().MarkPublished(ctx, rec.ID, time.Now().UTC()); err != nil {
+		if err := rtx.Outbox().MarkPublished(ctx, published, now); err != nil {
 			_ = rtx.Rollback(ctx)
-			return err
+			return 0, err
 		}
 		if err := rtx.Commit(ctx); err != nil {
-			return err
+			return 0, err
 		}
 	}
-	return nil
+	return len(recs), nil
 }
 
 type ReferenceWorker struct {
@@ -338,15 +382,23 @@ func NewReferenceWorker(svc *app.Service, log *zap.Logger) *ReferenceWorker {
 }
 
 func (w *ReferenceWorker) Run(ctx context.Context) error {
-	ticker := time.NewTicker(200 * time.Millisecond)
-	defer ticker.Stop()
+	delay := 200 * time.Millisecond
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-ticker.C:
-			if err := w.svc.RetryPendingReferences(ctx, 20); err != nil && ctx.Err() == nil {
+		case <-time.After(delay):
+			n, err := w.svc.RetryPendingReferences(ctx, 20)
+			if err != nil && ctx.Err() == nil {
 				w.log.Warn("pending reference retry failed", zap.Error(err))
+			}
+			if n == 0 {
+				delay *= 2
+				if delay > 2*time.Second {
+					delay = 2 * time.Second
+				}
+			} else {
+				delay = 200 * time.Millisecond
 			}
 		}
 	}

@@ -3,8 +3,7 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: finops
-      # NOT VALID — local test data only
-      POSTGRES_PASSWORD: NU_TEST_finops
+      POSTGRES_PASSWORD: NU_TEST_finops # NOT VALID — test data only
       POSTGRES_DB: finops
     ports:
       - "5432:5432"
@@ -28,12 +27,11 @@ services:
       retries: 20
 
   keycloak:
-    image: quay.io/keycloak/keycloak:26.0
+    image: keycloak/keycloak:26.0
     command: start-dev --import-realm --hostname-strict=false
     environment:
       KEYCLOAK_ADMIN: admin
-      # NOT VALID — local test data only
-      KEYCLOAK_ADMIN_PASSWORD: NU_TEST_admin
+      KEYCLOAK_ADMIN_PASSWORD: NU_TEST_admin # NOT VALID — test data only
     volumes:
       - ./deploy/keycloak:/opt/keycloak/data/import
     ports:
@@ -59,16 +57,15 @@ services:
       DATABASE_HOST: postgres
       DATABASE_PORT: "5432"
       DATABASE_USER: finops
-      DATABASE_PASSWORD: NU_TEST_finops
+      DATABASE_PASSWORD: NU_TEST_finops # NOT VALID — test data only
       DATABASE_NAME: finops
       DATABASE_SSLMODE: disable
       AWS_REGION: us-east-1
       AWS_ENDPOINT_URL: http://localstack:4566
-      AWS_ACCESS_KEY_ID: NU_TEST_localstack
-      AWS_SECRET_ACCESS_KEY: NU_TEST_localstack
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
       OIDC_ISSUER: http://keycloak:8080/realms/finops
       OIDC_AUDIENCE: finops-api
       INTERNAL_CLIENT_ID: wallet-internal
-      INSTANCE_ID: api-1
     ports:
       - "8080:8080"

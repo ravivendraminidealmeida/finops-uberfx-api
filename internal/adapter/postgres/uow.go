@@ -22,14 +22,32 @@ func NewUoW(pool *pgxpool.Pool) *UoW {
 }
 
 func (u *UoW) Begin(ctx context.Context) (app.Tx, error) {
-	tx, err := u.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+	return u.begin(ctx, pgx.ReadCommitted)
+}
+
+func (u *UoW) BeginSnapshot(ctx context.Context) (app.Tx, error) {
+	return u.begin(ctx, pgx.RepeatableRead)
+}
+
+func (u *UoW) Do(ctx context.Context, fn func(app.Tx) error) error {
+	tx, err := u.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (u *UoW) begin(ctx context.Context, iso pgx.TxIsoLevel) (app.Tx, error) {
+	tx, err := u.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: iso})
 	if err != nil {
 		return nil, err
 	}
 	return &Tx{tx: tx}, nil
 }
-
-func (u *UoW) Pool() *pgxpool.Pool { return u.pool }
 
 type Tx struct {
 	tx pgx.Tx
@@ -57,6 +75,9 @@ func mapPGErr(err error) error {
 		return domain.ErrWalletNotFound
 	}
 	var pg *pgconn.PgError
+	if errors.As(err, &pg) && pg.Code == "22003" {
+		return domain.ErrOverflow
+	}
 	if errors.As(err, &pg) && pg.Code == "23505" {
 		switch pg.ConstraintName {
 		case "wallets_player_id_currency_key":
@@ -71,13 +92,9 @@ func mapPGErr(err error) error {
 			return domain.ErrWalletConflict
 		case "wallet_ledger_wallet_id_transaction_id_key":
 			return domain.ErrIdempotencyConflict
-		case "inbox_pkey":
-			return errInboxExists
 		default:
 			return fmt.Errorf("unique violation on %s: %w", pg.ConstraintName, err)
 		}
 	}
 	return err
 }
-
-var errInboxExists = errors.New("inbox message exists")

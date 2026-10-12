@@ -9,7 +9,7 @@ import (
 )
 
 func main() {
-	cfg, err := config.Load()
+	dsn, err := config.DatabaseURL()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -20,9 +20,9 @@ func main() {
 	}
 	switch cmd {
 	case "up":
-		err = postgres.RunMigrations(cfg.DatabaseURL)
+		err = postgres.RunMigrations(dsn)
 	case "down":
-		err = postgres.RollbackLast(cfg.DatabaseURL)
+		err = postgres.RollbackLast(dsn)
 	default:
 		fmt.Fprintln(os.Stderr, "usage: migrate [up|down]")
 		os.Exit(1)

@@ -25,7 +25,7 @@ func FromContext(ctx context.Context) (Identity, bool) {
 	return id, ok
 }
 
-func WithIdentity(ctx context.Context, id Identity) context.Context {
+func withIdentity(ctx context.Context, id Identity) context.Context {
 	return context.WithValue(ctx, contextKey{}, id)
 }
 
@@ -79,13 +79,13 @@ func (v *Verifier) Middleware(next http.Handler) http.Handler {
 			clientID = claims.ClientID
 		}
 		ident := Identity{Subject: claims.Sub, ClientID: clientID, ProviderID: claims.ProviderID}
-		if ident.ProviderID == "" && clientID != v.internalClientID {
-			ident.ProviderID = clientID
-		}
 		if clientID == v.internalClientID {
 			ident.Internal = true
 			ident.ProviderID = ""
+		} else if ident.ProviderID == "" {
+			http.Error(w, `{"error":"unauthorized","message":"provider_id claim is required"}`, http.StatusUnauthorized)
+			return
 		}
-		next.ServeHTTP(w, r.WithContext(WithIdentity(r.Context(), ident)))
+		next.ServeHTTP(w, r.WithContext(withIdentity(r.Context(), ident)))
 	})
 }

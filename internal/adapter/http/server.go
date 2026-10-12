@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,52 +11,29 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.uber.org/zap"
 
 	"junglegaming.io/finops-api/internal/adapter/auth"
 	"junglegaming.io/finops-api/internal/app"
 	"junglegaming.io/finops-api/internal/domain"
-	"junglegaming.io/finops-api/internal/domain/idemp"
-	"junglegaming.io/finops-api/internal/domain/money"
 	"junglegaming.io/finops-api/internal/domain/wager"
 	"junglegaming.io/finops-api/internal/domain/wallet"
+	"junglegaming.io/finops-api/internal/platform/obs"
 )
 
-type HealthChecker interface {
-	Ready(ctx context.Context) error
-}
+type ReadyFunc func(ctx context.Context) error
 
 type Server struct {
 	svc     *app.Service
 	auth    *auth.Verifier
-	health  HealthChecker
-	metrics *Metrics
+	readyFn ReadyFunc
+	metrics *obs.Metrics
+	log     *zap.Logger
 }
 
-type Metrics struct {
-	ReconcileDivergences prometheus.Counter
-	Results              *prometheus.CounterVec
-}
-
-func NewMetrics() *Metrics {
-	m := &Metrics{
-		ReconcileDivergences: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "finops_reconciliation_divergences_total",
-			Help: "Wallet reconciliation mismatches",
-		}),
-		Results: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "finops_wager_results_total",
-			Help: "Wager processing results by status",
-		}, []string{"status", "kind"}),
-	}
-	_ = prometheus.Register(m.ReconcileDivergences)
-	_ = prometheus.Register(m.Results)
-	return m
-}
-
-func NewServer(svc *app.Service, verifier *auth.Verifier, health HealthChecker, metrics *Metrics) *Server {
-	return &Server{svc: svc, auth: verifier, health: health, metrics: metrics}
+func NewServer(svc *app.Service, verifier *auth.Verifier, ready ReadyFunc, metrics *obs.Metrics, log *zap.Logger) *Server {
+	return &Server{svc: svc, auth: verifier, readyFn: ready, metrics: metrics, log: log}
 }
 
 func (s *Server) Router() http.Handler {
@@ -72,6 +48,7 @@ func (s *Server) Router() http.Handler {
 
 	r.Group(func(r chi.Router) {
 		r.Use(s.auth.Middleware)
+		r.Use(middleware.Timeout(30 * time.Second))
 		r.Post("/wallets", s.openWallet)
 		r.Get("/wallets/{walletId}", s.getWallet)
 		r.Get("/wallets/{walletId}/ledger", s.listLedger)
@@ -84,11 +61,9 @@ func (s *Server) Router() http.Handler {
 }
 
 func (s *Server) ready(w http.ResponseWriter, r *http.Request) {
-	if s.health != nil {
-		if err := s.health.Ready(r.Context()); err != nil {
-			writeErr(w, http.StatusServiceUnavailable, "not_ready", err.Error())
-			return
-		}
+	if err := s.readyFn(r.Context()); err != nil {
+		writeErr(w, http.StatusServiceUnavailable, "not_ready", err.Error())
+		return
 	}
 	writeJSON(w, http.StatusOK, HealthResponse{Status: "ready"})
 }
@@ -100,11 +75,10 @@ func (s *Server) openWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body OpenWalletRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if err := decodeJSON(w, r, &body); err != nil {
 		return
 	}
-	amt, err := money.Parse(body.InitialBalance.Amount, body.InitialBalance.Currency)
+	amt, err := body.InitialBalance.Money()
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_amount", err.Error())
 		return
@@ -114,9 +88,8 @@ func (s *Server) openWallet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, err := s.svc.OpenWallet(r.Context(), app.OpenWalletCommand{
-		PlayerID:        wallet.PlayerID(body.PlayerID),
-		Initial:         amt,
-		InternalService: true,
+		PlayerID: wallet.PlayerID(body.PlayerID),
+		Initial:  amt,
 	})
 	if err != nil {
 		mapDomain(w, err)
@@ -126,6 +99,9 @@ func (s *Server) openWallet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getWallet(w http.ResponseWriter, r *http.Request) {
+	if !requireInternal(w, r) {
+		return
+	}
 	wal, err := s.svc.GetWallet(r.Context(), wallet.ID(chi.URLParam(r, "walletId")))
 	if err != nil {
 		mapDomain(w, err)
@@ -135,6 +111,9 @@ func (s *Server) getWallet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listLedger(w http.ResponseWriter, r *http.Request) {
+	if !requireInternal(w, r) {
+		return
+	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	afterTime := time.Time{}
 	afterID := ""
@@ -172,13 +151,20 @@ func (s *Server) listLedger(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) reconcile(w http.ResponseWriter, r *http.Request) {
+	if !requireInternal(w, r) {
+		return
+	}
 	res, err := s.svc.Reconcile(r.Context(), wallet.ID(chi.URLParam(r, "walletId")))
 	if err != nil {
 		mapDomain(w, err)
 		return
 	}
-	if !res.Consistent && s.metrics != nil {
+	if !res.Consistent {
 		s.metrics.ReconcileDivergences.Inc()
+		s.log.Warn("reconciliation divergence",
+			zap.String("walletId", chi.URLParam(r, "walletId")),
+			zap.String("correlationId", middleware.GetReqID(r.Context())),
+		)
 	}
 	writeJSON(w, http.StatusOK, NewReconcileResponse(res))
 }
@@ -195,11 +181,10 @@ func (s *Server) processWager(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body ProcessWagerRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_json", err.Error())
+	if err := decodeJSON(w, r, &body); err != nil {
 		return
 	}
-	amt, err := money.Parse(body.Money.Amount, body.Money.Currency)
+	amt, err := body.Money.Money()
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "invalid_amount", err.Error())
 		return
@@ -210,18 +195,10 @@ func (s *Server) processWager(w http.ResponseWriter, r *http.Request) {
 	}
 	kind, err := wager.ParseKind(body.Kind)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_kind", err.Error())
+		mapDomain(w, err)
 		return
 	}
-	hash, err := idemp.CanonicalHash(idemp.BusinessFields(
-		body.ProviderID, body.ExternalTransactionID, body.PlayerID, body.WalletID,
-		body.RoundID, body.GameID, body.Kind, amt.DecimalString(), amt.Currency(), body.ReferenceExternalID,
-	))
-	if err != nil {
-		writeErr(w, http.StatusBadRequest, "invalid_payload", err.Error())
-		return
-	}
-	res, err := s.svc.ProcessWager(r.Context(), app.ProcessWagerCommand{
+	cmd := app.ProcessWagerCommand{
 		ProviderID:            body.ProviderID,
 		ExternalTransactionID: body.ExternalTransactionID,
 		IdempotencyKey:        key,
@@ -232,17 +209,35 @@ func (s *Server) processWager(w http.ResponseWriter, r *http.Request) {
 		Kind:                  kind,
 		Amount:                amt,
 		ReferenceExternalID:   body.ReferenceExternalID,
-		PayloadHash:           hash,
-		CorrelationID:         middleware.GetReqID(r.Context()),
 		AuthenticatedProvider: ident.ProviderID,
-	})
+	}
+	started := time.Now()
+	res, err := s.svc.ProcessWager(r.Context(), cmd)
+	s.metrics.ProcessingSeconds.Observe(time.Since(started).Seconds())
 	if err != nil {
+		if domain.IsConflict(err) {
+			s.metrics.Conflicts.Inc()
+		}
+		s.log.Info("wager rejected at gateway",
+			zap.Error(err),
+			zap.String("correlationId", middleware.GetReqID(r.Context())),
+			zap.String("walletId", body.WalletID),
+			zap.String("providerId", ident.ProviderID),
+		)
 		mapDomain(w, err)
 		return
 	}
-	if s.metrics != nil {
-		s.metrics.Results.WithLabelValues(string(res.Transaction.Status()), string(res.Transaction.Kind())).Inc()
+	s.metrics.Results.WithLabelValues(string(res.Transaction.Status()), string(res.Transaction.Kind())).Inc()
+	if res.IdempotentReplay {
+		s.metrics.Duplicates.Inc()
 	}
+	s.log.Info("wager processed",
+		zap.String("correlationId", middleware.GetReqID(r.Context())),
+		zap.String("transactionId", string(res.Transaction.ID())),
+		zap.String("walletId", body.WalletID),
+		zap.String("providerId", ident.ProviderID),
+		zap.String("status", string(res.Transaction.Status())),
+	)
 	status := http.StatusOK
 	if res.Transaction.Status() == wager.StatusPendingReference {
 		status = http.StatusAccepted
@@ -284,19 +279,37 @@ func writeErr(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, ErrorResponse{Error: code, Message: msg})
 }
 
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid_json", err.Error())
+		return err
+	}
+	return nil
+}
+
+func requireInternal(w http.ResponseWriter, r *http.Request) bool {
+	id, ok := auth.FromContext(r.Context())
+	if !ok || !id.Internal {
+		writeErr(w, http.StatusForbidden, "forbidden", "internal service identity required")
+		return false
+	}
+	return true
+}
+
 func mapDomain(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, domain.ErrWalletNotFound), errors.Is(err, domain.ErrTransactionNotFound):
+	case domain.IsNotFound(err):
 		writeErr(w, http.StatusNotFound, "not_found", err.Error())
-	case errors.Is(err, domain.ErrWalletConflict), errors.Is(err, domain.ErrIdempotencyConflict), errors.Is(err, domain.ErrExternalIDConflict):
+	case domain.IsConflict(err):
 		writeErr(w, http.StatusConflict, "conflict", err.Error())
-	case errors.Is(err, domain.ErrUnauthorizedProvider), errors.Is(err, domain.ErrUnauthorizedInternal):
+	case domain.IsForbidden(err):
 		writeErr(w, http.StatusForbidden, "forbidden", err.Error())
-	case errors.Is(err, domain.ErrOpeningNotAllowed), errors.Is(err, domain.ErrInvalidKind), errors.Is(err, domain.ErrInvalidAmount),
-		errors.Is(err, domain.ErrInvalidIdempotencyKey), errors.Is(err, domain.ErrReferenceRequired), errors.Is(err, domain.ErrCurrencyMismatch):
+	case domain.IsInvalidRequest(err):
 		writeErr(w, http.StatusBadRequest, "invalid_request", err.Error())
-	case errors.Is(err, domain.ErrInsufficientFunds), errors.Is(err, domain.ErrInsufficientFundsReversal),
-		errors.Is(err, domain.ErrDuplicateReversal), errors.Is(err, domain.ErrReferenceMismatch):
+	case domain.IsRejected(err):
 		writeErr(w, http.StatusUnprocessableEntity, "rejected", err.Error())
 	default:
 		writeErr(w, http.StatusInternalServerError, "internal_error", "transient failure")

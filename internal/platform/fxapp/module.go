@@ -2,7 +2,9 @@ package fxapp
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -15,7 +17,7 @@ import (
 	sqsadapter "junglegaming.io/finops-api/internal/adapter/sqs"
 	"junglegaming.io/finops-api/internal/app"
 	"junglegaming.io/finops-api/internal/platform/config"
-	"junglegaming.io/finops-api/internal/platform/health"
+	"junglegaming.io/finops-api/internal/platform/obs"
 )
 
 func Module() fx.Option {
@@ -54,12 +56,11 @@ var postgresModule = fx.Module("postgres",
 )
 
 var sqsModule = fx.Module("sqs",
-	fx.Provide(func(lc fx.Lifecycle, cfg config.Config) (*sqsadapter.Client, error) {
+	fx.Provide(func(cfg config.Config) (*sqsadapter.Client, error) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		return sqsadapter.NewClient(ctx, cfg)
 	}),
-	fx.Provide(func(c *sqsadapter.Client) app.EventPublisher { return c }),
 )
 
 var authModule = fx.Module("auth",
@@ -82,19 +83,27 @@ var appModule = fx.Module("app",
 )
 
 var httpModule = fx.Module("http",
-	fx.Provide(httpapi.NewMetrics),
-	fx.Provide(func(pool *pgxpool.Pool, sqs *sqsadapter.Client) *health.Checker {
-		return health.New(pool, sqs)
+	fx.Provide(obs.NewMetrics),
+	fx.Provide(func(pool *pgxpool.Pool, sqs *sqsadapter.Client) httpapi.ReadyFunc {
+		return func(ctx context.Context) error {
+			if err := pool.Ping(ctx); err != nil {
+				return err
+			}
+			return sqs.Ready(ctx)
+		}
 	}),
-	fx.Provide(func(svc *app.Service, v *auth.Verifier, h *health.Checker, m *httpapi.Metrics) *httpapi.Server {
-		return httpapi.NewServer(svc, v, h, m)
-	}),
-	fx.Invoke(func(lc fx.Lifecycle, cfg config.Config, srv *httpapi.Server, log *zap.Logger) {
+	fx.Provide(httpapi.NewServer),
+	fx.Invoke(func(lc fx.Lifecycle, cfg config.Config, srv *httpapi.Server, log *zap.Logger, shutdowner fx.Shutdowner) {
 		server := &http.Server{Addr: cfg.HTTPAddr, Handler: srv.Router()}
 		lc.Append(fx.Hook{
 			OnStart: func(ctx context.Context) error {
 				log.Info("http listening", zap.String("addr", cfg.HTTPAddr))
-				go func() { _ = server.ListenAndServe() }()
+				go func() {
+					if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+						log.Error("http server failed", zap.Error(err))
+						_ = shutdowner.Shutdown()
+					}
+				}()
 				return nil
 			},
 			OnStop: func(ctx context.Context) error {
@@ -107,28 +116,42 @@ var httpModule = fx.Module("http",
 )
 
 var workersModule = fx.Module("workers",
-	fx.Provide(func(c *sqsadapter.Client, svc *app.Service, log *zap.Logger) *sqsadapter.Consumer {
-		return sqsadapter.NewConsumer(c, svc, log)
+	fx.Provide(sqsadapter.NewConsumer),
+	fx.Provide(func(uow app.UnitOfWork, c *sqsadapter.Client, cfg config.Config, clock app.Clock, log *zap.Logger, m *obs.Metrics) *sqsadapter.Publisher {
+		return sqsadapter.NewPublisher(uow, c, cfg.InstanceID, clock, log, m)
 	}),
-	fx.Provide(func(uow app.UnitOfWork, c *sqsadapter.Client, cfg config.Config, log *zap.Logger) *sqsadapter.Publisher {
-		return sqsadapter.NewPublisher(uow, c, cfg.InstanceID, log)
-	}),
-	fx.Provide(func(svc *app.Service, log *zap.Logger) *sqsadapter.ReferenceWorker {
-		return sqsadapter.NewReferenceWorker(svc, log)
-	}),
+	fx.Provide(sqsadapter.NewReferenceWorker),
 	fx.Invoke(func(lc fx.Lifecycle, consumer *sqsadapter.Consumer, pub *sqsadapter.Publisher, refs *sqsadapter.ReferenceWorker, log *zap.Logger) {
 		ctx, cancel := context.WithCancel(context.Background())
+		var wg sync.WaitGroup
 		lc.Append(fx.Hook{
 			OnStart: func(_ context.Context) error {
-				go func() { _ = consumer.Run(ctx) }()
-				go func() { _ = pub.Run(ctx) }()
-				go func() { _ = refs.Run(ctx) }()
+				start := func(run func(context.Context) error) {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						_ = run(ctx)
+					}()
+				}
+				start(consumer.Run)
+				start(pub.Run)
+				start(refs.Run)
 				return nil
 			},
-			OnStop: func(_ context.Context) error {
+			OnStop: func(stopCtx context.Context) error {
 				cancel()
 				log.Info("workers stopping")
-				return nil
+				done := make(chan struct{})
+				go func() {
+					wg.Wait()
+					close(done)
+				}()
+				select {
+				case <-done:
+					return nil
+				case <-stopCtx.Done():
+					return stopCtx.Err()
+				}
 			},
 		})
 	}),

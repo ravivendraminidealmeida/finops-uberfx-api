@@ -32,7 +32,7 @@ func (r *wagerRepo) Update(ctx context.Context, tx *wager.Transaction) error {
 			processed_at = $9
 		WHERE id = $1
 	`, tx.ID(), tx.Status(), nilIfEmpty(string(tx.ReferencedInternalID())), nilIfEmpty(string(tx.FailureCode())),
-		tx.ResultBalanceMinor(), tx.AttemptCount(), tx.NextAttemptAt(), tx.UpdatedAt(), tx.ProcessedAt())
+		resultMinor(tx), tx.AttemptCount(), nilTime(tx.NextAttemptAt()), tx.UpdatedAt(), nilTime(tx.ProcessedAt()))
 	if err != nil {
 		return err
 	}
@@ -50,8 +50,8 @@ func (r *wagerRepo) LockByID(ctx context.Context, id wager.ID) (*wager.Transacti
 	return r.scan(r.q.QueryRow(ctx, wagerSelect+" WHERE id = $1 FOR UPDATE", id), domain.ErrTransactionNotFound)
 }
 
-func (r *wagerRepo) GetByIdempotencyKey(ctx context.Context, key string) (*wager.Transaction, error) {
-	return r.scan(r.q.QueryRow(ctx, wagerSelect+" WHERE idempotency_key = $1", key), domain.ErrTransactionNotFound)
+func (r *wagerRepo) GetByIdempotencyKey(ctx context.Context, providerID, key string) (*wager.Transaction, error) {
+	return r.scan(r.q.QueryRow(ctx, wagerSelect+" WHERE provider_id = $1 AND idempotency_key = $2", providerID, key), domain.ErrTransactionNotFound)
 }
 
 func (r *wagerRepo) GetByExternalID(ctx context.Context, providerID, externalID string) (*wager.Transaction, error) {
@@ -62,17 +62,17 @@ func (r *wagerRepo) LockByExternalID(ctx context.Context, providerID, externalID
 	return r.scan(r.q.QueryRow(ctx, wagerSelect+" WHERE provider_id = $1 AND external_transaction_id = $2 FOR UPDATE", providerID, externalID), domain.ErrTransactionNotFound)
 }
 
-func (r *wagerRepo) HasActiveReversal(ctx context.Context, referenced wager.ID, kind wager.Kind, except wager.ID) (bool, error) {
+func (r *wagerRepo) HasActiveReversal(ctx context.Context, referenced wager.ID, except wager.ID) (bool, error) {
 	var exists bool
 	err := r.q.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM wager_transactions
 			 WHERE referenced_transaction_id = $1
-			   AND kind = $2
-			   AND id <> $3
+			   AND kind IN ('REFUND', 'ROLLBACK')
+			   AND id <> $2
 			   AND status IN ('PENDING', 'PENDING_REFERENCE', 'PROCESSED')
 		)
-	`, referenced, kind, except).Scan(&exists)
+	`, referenced, except).Scan(&exists)
 	return exists, err
 }
 
@@ -135,8 +135,8 @@ func wagerArgs(tx *wager.Transaction) []any {
 		nilIfEmpty(tx.IdempotencyKey()), nilIfEmpty(tx.PayloadHash()),
 		nilIfEmpty(tx.RoundID()), nilIfEmpty(tx.GameID()),
 		nilIfEmpty(tx.ReferenceExternalID()), nilIfEmpty(string(tx.ReferencedInternalID())),
-		nilIfEmpty(string(tx.FailureCode())), tx.ResultBalanceMinor(), tx.AttemptCount(),
-		tx.NextAttemptAt(), tx.CreatedAt(), tx.UpdatedAt(), tx.ProcessedAt(),
+		nilIfEmpty(string(tx.FailureCode())), resultMinor(tx), tx.AttemptCount(),
+		nilTime(tx.NextAttemptAt()), tx.CreatedAt(), tx.UpdatedAt(), nilTime(tx.ProcessedAt()),
 	}
 }
 
@@ -173,20 +173,30 @@ func scanWager(row rowScanner) (*wager.Transaction, error) {
 	if err != nil {
 		return nil, err
 	}
-	return wager.Rehydrate(rehydrated(
-		id, origin, kind, status, walletID, playerID, amt,
-		derefStr(provider), derefStr(extID), derefStr(idem), derefStr(hash),
-		derefStr(roundID), derefStr(gameID), derefStr(refExt), derefStr(refInt),
-		derefStr(fail), resultMinor, attempts, nextAttempt, created, updated, processed,
-	))
+	return wager.Rehydrate(wager.Snapshot{
+		ID: id, Origin: origin, Kind: kind, Status: status, WalletID: walletID, PlayerID: playerID,
+		Amount: amt, ProviderID: derefStr(provider), ExternalID: derefStr(extID),
+		IdempotencyKey: derefStr(idem), PayloadHash: derefStr(hash),
+		RoundID: derefStr(roundID), GameID: derefStr(gameID),
+		ReferenceExternalID: derefStr(refExt), ReferencedID: derefStr(refInt),
+		FailureCode: derefStr(fail), ResultMinor: resultMinor, AttemptCount: attempts,
+		NextAttempt: nextAttempt, Processed: processed, CreatedAt: created, UpdatedAt: updated,
+	})
 }
 
-func rehydrated(
-	id, origin, kind, status, walletID, playerID string, amt money.Money,
-	provider, extID, idem, hash, roundID, gameID, refExt, refInt, fail string,
-	resultMinor *int64, attempts int, next *time.Time, created, updated time.Time, processed *time.Time,
-) wager.Transaction {
-	return wager.MustRehydrate(id, origin, kind, status, walletID, playerID, amt, provider, extID, idem, hash, roundID, gameID, refExt, refInt, fail, resultMinor, attempts, next, created, updated, processed)
+func resultMinor(tx *wager.Transaction) any {
+	bal, ok := tx.ResultBalance()
+	if !ok {
+		return nil
+	}
+	return bal.Minor()
+}
+
+func nilTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
 }
 
 func nilIfEmpty(s string) any {
