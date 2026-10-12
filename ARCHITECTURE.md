@@ -1,62 +1,66 @@
-# Architecture
+# Arquitetura
 
-## Money
+## Dinheiro
 
-`Money` is an immutable value object: `int64` minor units (centavos) plus an ISO 4217 code. External JSON is always `{"amount":"25.00","currency":"BRL"}`. Parsing requires exactly two decimal places, rejects `NaN` / `Infinity` / scientific notation / leading zeros / extra scale, and checks overflow on parse, add, sub and negate. Persistence is `BIGINT` + `CHAR(3)`. No `float32`/`float64` on any path. Arithmetic requires equal currencies. External inputs cannot be negative; internal differences may be.
+`Money` é um value object imutável: `int64` em unidades mínimas (centavos) mais código ISO 4217. O domínio fala `Parse` / `DecimalString` / `FromMinor`; não implementa `json.Marshaler`. HTTP/SQS mapeiam `{"amount":"25.00","currency":"BRL"}` no adapter (`wire.Money`). O parse exige exatamente duas casas, rejeita `NaN` / `Infinity` / notação científica / zeros à esquerda / escala extra, e verifica overflow em parse, soma, subtração e negação. Persistência é `BIGINT` + `CHAR(3)`. Nenhum `float32`/`float64` no caminho. Aritmética exige moedas iguais. Entradas externas não podem ser negativas; diferenças internas podem.
 
-Idempotency hashes use the canonical decimal string after a successful parse (`25.00`), SHA-256 of key-sorted JSON of business fields (not the Idempotency-Key header or transport metadata). HTTP and SQS share `idemp.BusinessFields`.
+O hash de idempotência usa a string decimal canônica depois de um parse válido (`25.00`), depois SHA-256 de `encoding/json` sobre um `map` de campos de negócio (Go ordena as chaves; Idempotency-Key e metadados de transporte SQS ficam de fora). `ProcessWager` calcula o hash; HTTP e SQS compartilham o mesmo `idemp.Payload`.
 
-## Transactions and unit of work
+## Transações e unidade de trabalho
 
-A single PostgreSQL transaction (`ReadCommitted`) covers, as applicable: inbox insert/complete, wager row, conditional wallet `UPDATE`, ledger insert, outbox inserts. Events are never published inside that transaction. `pgx` with explicit SQL; repositories receive the same `pgx.Tx`.
+Uma única transação PostgreSQL (`ReadCommitted`) cobre, conforme o caso: insert/complete da inbox, linha da aposta, `UPDATE` da carteira por versão, insert do ledger, inserts da outbox. Eventos nunca são publicados dentro dessa transação. `pgx` com SQL explícito; os repositórios recebem o mesmo `pgx.Tx`. Reconciliação usa `RepeatableRead` para ler saldo e soma do ledger no mesmo snapshot.
 
-## Concurrency (hybrid)
+## Concorrência (híbrida)
 
-Debits:
+A linha da carteira é lida com `SELECT ... FOR UPDATE` **antes** da busca de idempotência. Débito e crédito acontecem no agregado (`Wallet.Debit` / `Credit`) e persistem com:
 
 ```
-UPDATE wallets SET balance_minor = balance_minor - $amt, version = version + 1
- WHERE id = $id AND currency = $cur AND balance_minor >= $amt
- RETURNING balance_minor, version
+UPDATE wallets SET balance_minor = $after, version = $new, updated_at = $now
+ WHERE id = $id AND version = $expected AND currency = $cur
 ```
 
-Zero rows is insufficient funds (or `INSUFFICIENT_FUNDS_REVERSAL` for a debiting `ROLLBACK`). Credits omit the balance predicate. `CHECK (balance_minor >= 0)` is the last line of defence. `version` starts at 1 and increments only when the balance changes.
+`CHECK (balance_minor >= 0)` é a última linha de defesa. `version` começa em 1 e só incrementa quando o saldo muda.
 
-`REFUND`/`ROLLBACK` take `SELECT ... FOR UPDATE` on the referenced wager row, then `HasActiveReversal` plus unique `(referenced_transaction_id, kind)` for in-flight/processed reversals. Independent wallets never share a lock.
+`REFUND`/`ROLLBACK` fazem `SELECT ... FOR UPDATE` na aposta referenciada, depois `HasActiveReversal` e unique em `referenced_transaction_id`. Carteiras independentes nunca compartilham lock.
 
-Lost updates cannot skip a committed write: the balance mutation is a single atomic `UPDATE`.
+Atualização perdida não atravessa um write commitado: o `FOR UPDATE` serializa escritores da mesma carteira, inclusive entre processos.
 
-## Idempotency
+## Idempotência
 
-Persistent uniques: `(provider_id, external_transaction_id)` for external operations; `idempotency_key`; `(wallet_id)` for `OPENING`. Same key + same hash returns the stored result and `idempotentReplay=true`, including the original `result_balance_minor`. Same key + different hash is HTTP 409. Same external id with a different key is 409. A unique race retries as replay when the hash matches.
+Uniques persistentes: `(provider_id, external_transaction_id)` para operações externas; `(provider_id, idempotency_key)`; `(wallet_id)` para `OPENING`. Mesma chave + mesmo hash devolve o resultado gravado e `idempotentReplay=true`, inclusive o `result_balance_minor` original. Mesma chave + hash diferente é HTTP 409. Mesmo id externo com outra chave é 409. Insert da inbox usa `ON CONFLICT DO NOTHING`.
 
-## References
+## Referências
 
-Missing or still-pending references persist `PENDING_REFERENCE` with exponential backoff (`PENDING_REF_BACKOFF_MS * 2^(attempt-1)`) and a max attempt count. Inbox may complete once the pending row is durable; the reference worker resumes. Exhaustion → `REJECTED` / `REFERENCE_NOT_FOUND`. A reference that exists but is `REJECTED`/`FAILED` → `REFERENCE_NOT_PROCESSED`. `REFUND` applies only to a processed `BET`. `ROLLBACK` applies to processed `BET`/`WIN`/`REFUND`. `REFUND` then `ROLLBACK` of the same bet: refund credits; rollback of the refund debits; a second refund of the same bet is `DUPLICATE_REVERSAL`. A reversal debit that would exceed the balance is `INSUFFICIENT_FUNDS_REVERSAL`, distinct from `INSUFFICIENT_FUNDS`.
+Referências ausentes ou ainda pendentes persistem `PENDING_REFERENCE` com backoff exponencial (`PENDING_REF_BACKOFF_MS * 2^(attempt-1)`) e teto de tentativas. A inbox pode completar assim que a linha pendente é durável; o worker de referência retoma. Esgotamento → `REJECTED` / `REFERENCE_NOT_FOUND`. Referência existente `REJECTED`/`FAILED` → `REFERENCE_NOT_PROCESSED`. `REFUND` só se aplica a `BET` processada. `ROLLBACK` se aplica a `BET`/`WIN`/`REFUND` processadas. `WIN` aceita referência opcional a uma `BET` (valor do prêmio pode diferir da aposta; não entra no unique de reversão). `REFUND` e `ROLLBACK` do mesmo BET são mutuamente exclusivos (`DUPLICATE_REVERSAL`). `ROLLBACK` de um `REFUND` debita o reembolso. Débito de reversão que estouraria o saldo é `INSUFFICIENT_FUNDS_REVERSAL`.
 
 ## Inbox / outbox / SQS
 
-- Inbound FIFO `wager-transactions.fifo` with DLQ `wager-transactions-dlq.fifo`, `maxReceiveCount=5`, visibility 60s, long poll 10s.
-- `MessageGroupId` = `walletId` (broker serialization per wallet; HTTP still races, so SQL remains authoritative).
-- `MessageDeduplicationId` = envelope `messageId` (5-minute SQS window only).
-- Inbox uniqueness `(consumer_name, message_id)` plus payload hash. Delete SQS message only after commit. Business rejections delete; infrastructure errors do not (redrive → DLQ).
-- Outbox claimed with `FOR UPDATE SKIP LOCKED`; publish to `domain-events.fifo` preserving `eventId`; mark published afterwards. Crash between publish and mark republishes the same `eventId`.
+- Entrada FIFO `wager-transactions.fifo` com DLQ `wager-transactions-dlq.fifo`, `maxReceiveCount=5`, visibilidade 60s, long poll 10s.
+- `MessageGroupId` = `walletId`. `MessageDeduplicationId` = `messageId` do envelope.
+- Delete da mensagem SQS só depois do commit de um tratamento durável (sucesso ou rejeição de negócio persistida). JSON inválido, kind/money inválidos e erros de aplicação **não** apagam a mensagem; o redrive leva à DLQ.
+- Outbox reivindicada com `FOR UPDATE SKIP LOCKED`; publicação em `domain-events.fifo` com `MessageGroupId` = id da carteira.
 
-## Authentication
+Eventos usam structs concretas (`WagerProcessedData`, `BalanceChangedData`, …) no campo `data` do envelope.
 
-Keycloak realm `finops`, `client_credentials`. Clients `provider-a` / `provider-b` mint JWTs with `provider_id` and audience `finops-api`. `wallet-internal` is the only identity allowed to `POST /wallets`. Middleware verifies signature/expiry/audience via JWKS. The token's `provider_id` (or `azp`) is authoritative; body/path mismatch is 403 with no financial effect. SQS access is broker credentials; the consumer still applies domain rules. No password storage or local token minting.
+## Autenticação
+
+Realm Keycloak `finops`, `client_credentials`. Clients `provider-a` / `provider-b` emitem JWT com `provider_id` e audience `finops-api`. `wallet-internal` é a única identidade permitida em carteira, ledger e reconciliação. O middleware verifica assinatura/expiração/audience via JWKS. Sem o claim `provider_id`, 401. Divergência de corpo/path é 403. Sem armazenamento de senha nem emissão local de token.
 
 ## Uber Fx
 
-Modules: `config`, `postgres`, `sqs`, `auth`, `app`, `http`, `workers`. Domain packages do not import Fx. Lifecycle starts migrations, pool ping, HTTP server, consumer, outbox publisher, reference worker. Stop cancels worker context, shuts down HTTP, then closes the pool.
+Módulos: `config`, `postgres`, `sqs`, `auth`, `app`, `http`, `workers`. Pacotes de domínio não importam Fx. O stop cancela o contexto dos workers e espera, faz `Shutdown` do HTTP e depois fecha o pool.
 
-## Shutdown
+## Observabilidade
 
-`SIGTERM` → Fx `OnStop`: workers stop receiving, HTTP `Shutdown`, in-flight SQS handlers that do not finish keep the message (visibility restores). Outbox locks expire and are taken by another instance.
+Logs JSON com `correlationId`, `messageId`, `transactionId`, `walletId` e `providerId` (sem payload financeiro). Métricas Prometheus: resultados por status, duplicatas, retries, candidatos a DLQ, conflitos, atraso da outbox, latência de processamento e divergências de reconciliação.
 
-## Limitations
+## Encerramento
 
-- Only BRL is exercised in tests; the type still carries currency.
-- Access tokens are treated as OIDC JWTs (Keycloak default).
-- Outbox destination is SQS FIFO, not SNS/EventBridge.
-- `FAILED` is reserved for permanent infrastructure recorded explicitly; most infra errors stay retryable.
+`SIGTERM` → Fx `OnStop`: workers param de receber, HTTP `Shutdown`. Mensagens SQS em voo que não terminam mantêm visibilidade.
+
+## Limitações
+
+- Só BRL é exercitado nos testes; o tipo ainda carrega a moeda.
+- Destino da outbox é SQS FIFO, não SNS/EventBridge.
+- `FAILED` fica reservado a infraestrutura permanente gravada explicitamente.
+- O teste de “três instâncias” usa três `Service`/pools no mesmo processo (conexões e heaps independentes). Processos OS separados ficam no `docker compose --scale`.
