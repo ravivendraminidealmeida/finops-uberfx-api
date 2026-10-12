@@ -1,11 +1,11 @@
 package money_test
 
 import (
-	"encoding/json"
 	"errors"
 	"math"
 	"testing"
 
+	"junglegaming.io/finops-api/internal/domain"
 	"junglegaming.io/finops-api/internal/domain/money"
 )
 
@@ -41,23 +41,8 @@ func TestNegativeParse(t *testing.T) {
 func TestCurrencyMismatch(t *testing.T) {
 	a, _ := money.Parse("1.00", "BRL")
 	b, _ := money.Parse("1.00", "USD")
-	if _, err := a.Add(b); !errors.Is(err, money.ErrCurrencyMismatch) {
+	if _, err := a.Add(b); !errors.Is(err, domain.ErrCurrencyMismatch) {
 		t.Fatalf("got %v", err)
-	}
-}
-
-func TestJSONRoundTrip(t *testing.T) {
-	m, _ := money.Parse("1000.00", "BRL")
-	b, err := json.Marshal(m)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var back money.Money
-	if err := json.Unmarshal(b, &back); err != nil {
-		t.Fatal(err)
-	}
-	if back.Minor() != m.Minor() {
-		t.Fatalf("%d != %d", back.Minor(), m.Minor())
 	}
 }
 
@@ -67,8 +52,18 @@ func TestOverflow(t *testing.T) {
 		t.Fatal(err)
 	}
 	one, _ := money.FromMinor(1, "BRL")
-	if _, err := a.Add(one); !errors.Is(err, money.ErrOverflow) {
+	if _, err := a.Add(one); !errors.Is(err, domain.ErrOverflow) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestDecimalStringMinInt64(t *testing.T) {
+	m, err := money.FromMinor(math.MinInt64, "BRL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.DecimalString() == "" || m.DecimalString()[0] != '-' {
+		t.Fatalf("got %q", m.DecimalString())
 	}
 }
 

@@ -21,26 +21,14 @@ type Wallet struct {
 }
 
 func New(id ID, playerID PlayerID, initial money.Money, now time.Time) (*Wallet, error) {
-	if id == "" || playerID == "" {
-		return nil, domain.ErrUninitialized
-	}
-	if !initial.Initialized() {
-		return nil, domain.ErrUninitialized
-	}
-	if initial.IsNegative() {
-		return nil, domain.ErrInvalidAmount
-	}
-	return &Wallet{
-		id:        id,
-		playerID:  playerID,
-		balance:   initial,
-		version:   1,
-		createdAt: now.UTC(),
-		updatedAt: now.UTC(),
-	}, nil
+	return hydrate(id, playerID, initial, 1, now, now)
 }
 
 func Rehydrate(id ID, playerID PlayerID, balance money.Money, version int64, createdAt, updatedAt time.Time) (*Wallet, error) {
+	return hydrate(id, playerID, balance, version, createdAt, updatedAt)
+}
+
+func hydrate(id ID, playerID PlayerID, balance money.Money, version int64, createdAt, updatedAt time.Time) (*Wallet, error) {
 	if id == "" || playerID == "" || !balance.Initialized() || version < 1 {
 		return nil, domain.ErrUninitialized
 	}
@@ -66,18 +54,15 @@ func (w *Wallet) CreatedAt() time.Time { return w.createdAt }
 func (w *Wallet) UpdatedAt() time.Time { return w.updatedAt }
 
 func (w *Wallet) Debit(amount money.Money, now time.Time) (before, after money.Money, err error) {
-	if err := w.ensureCompatible(amount); err != nil {
+	if err := w.readyFor(amount); err != nil {
 		return money.Money{}, money.Money{}, err
 	}
-	if !amount.IsPositive() {
-		return money.Money{}, money.Money{}, domain.ErrInvalidAmount
-	}
 	before = w.balance
-	cmp, err := w.balance.Cmp(amount)
+	lt, err := before.Less(amount)
 	if err != nil {
 		return money.Money{}, money.Money{}, err
 	}
-	if cmp < 0 {
+	if lt {
 		return money.Money{}, money.Money{}, domain.ErrInsufficientFunds
 	}
 	after, err = w.balance.Sub(amount)
@@ -89,11 +74,8 @@ func (w *Wallet) Debit(amount money.Money, now time.Time) (before, after money.M
 }
 
 func (w *Wallet) Credit(amount money.Money, now time.Time) (before, after money.Money, err error) {
-	if err := w.ensureCompatible(amount); err != nil {
+	if err := w.readyFor(amount); err != nil {
 		return money.Money{}, money.Money{}, err
-	}
-	if !amount.IsPositive() {
-		return money.Money{}, money.Money{}, domain.ErrInvalidAmount
 	}
 	before = w.balance
 	after, err = w.balance.Add(amount)
@@ -110,15 +92,22 @@ func (w *Wallet) applyBalance(after money.Money, now time.Time) {
 	w.updatedAt = now.UTC()
 }
 
-func (w *Wallet) ensureCompatible(amount money.Money) error {
-	if w == nil || w.id == "" || !w.balance.Initialized() {
-		return domain.ErrUninitialized
-	}
-	if !amount.Initialized() {
+func (w *Wallet) MustMatchCurrency(amount money.Money) error {
+	if w.id == "" || !w.balance.Initialized() || !amount.Initialized() {
 		return domain.ErrUninitialized
 	}
 	if amount.Currency() != w.balance.Currency() {
 		return fmt.Errorf("%w: %s vs %s", domain.ErrCurrencyMismatch, amount.Currency(), w.balance.Currency())
+	}
+	return nil
+}
+
+func (w *Wallet) readyFor(amount money.Money) error {
+	if err := w.MustMatchCurrency(amount); err != nil {
+		return err
+	}
+	if !amount.IsPositive() {
+		return domain.ErrInvalidAmount
 	}
 	return nil
 }

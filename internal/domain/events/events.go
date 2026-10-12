@@ -6,27 +6,76 @@ import (
 	"junglegaming.io/finops-api/internal/domain/ledger"
 	"junglegaming.io/finops-api/internal/domain/money"
 	"junglegaming.io/finops-api/internal/domain/wager"
-	"junglegaming.io/finops-api/internal/domain/wallet"
 )
 
 const EnvelopeVersion = 1
 
-type Envelope struct {
-	EventID       string         `json:"eventId"`
-	EventType     string         `json:"eventType"`
-	AggregateID   string         `json:"aggregateId"`
-	CorrelationID string         `json:"correlationId"`
-	CausationID   string         `json:"causationId,omitempty"`
-	OccurredAt    time.Time      `json:"occurredAt"`
-	Version       int            `json:"version"`
-	Data          map[string]any `json:"data"`
+type MoneyAmount struct {
+	Amount   string `json:"amount"`
+	Currency string `json:"currency"`
 }
 
-func NewEnvelope(eventID, eventType, aggregateID, correlationID, causationID string, occurredAt time.Time, data map[string]any) Envelope {
+func moneyAmount(m money.Money) MoneyAmount {
+	return MoneyAmount{Amount: m.DecimalString(), Currency: m.Currency()}
+}
+
+type Envelope struct {
+	EventID       string
+	EventType     string
+	AggregateID   string
+	GroupID       string
+	CorrelationID string
+	CausationID   string
+	OccurredAt    time.Time
+	Version       int
+	Data          any
+}
+
+type WagerProcessedData struct {
+	TransactionID         string      `json:"transactionId"`
+	Kind                  string      `json:"kind"`
+	Status                string      `json:"status"`
+	WalletID              string      `json:"walletId"`
+	PlayerID              string      `json:"playerId"`
+	Money                 MoneyAmount `json:"money"`
+	ProviderID            string      `json:"providerId,omitempty"`
+	ExternalTransactionID string      `json:"externalTransactionId,omitempty"`
+	RoundID               string      `json:"roundId,omitempty"`
+	GameID                string      `json:"gameId,omitempty"`
+}
+
+type WagerRejectedData struct {
+	TransactionID         string `json:"transactionId"`
+	Kind                  string `json:"kind"`
+	FailureCode           string `json:"failureCode"`
+	WalletID              string `json:"walletId"`
+	ProviderID            string `json:"providerId,omitempty"`
+	ExternalTransactionID string `json:"externalTransactionId,omitempty"`
+}
+
+type PendingReferenceData struct {
+	TransactionID       string `json:"transactionId"`
+	ProviderID          string `json:"providerId"`
+	ReferenceExternalID string `json:"referenceExternalTransactionId"`
+	AttemptCount        int    `json:"attemptCount"`
+}
+
+type BalanceChangedData struct {
+	WalletID      string      `json:"walletId"`
+	TransactionID string      `json:"transactionId"`
+	Direction     string      `json:"direction"`
+	Money         MoneyAmount `json:"money"`
+	BalanceBefore MoneyAmount `json:"balanceBefore"`
+	BalanceAfter  MoneyAmount `json:"balanceAfter"`
+	WalletVersion int64       `json:"walletVersion"`
+}
+
+func newEnvelope(eventID, eventType, aggregateID, groupID, correlationID, causationID string, occurredAt time.Time, data any) Envelope {
 	return Envelope{
 		EventID:       eventID,
 		EventType:     eventType,
 		AggregateID:   aggregateID,
+		GroupID:       groupID,
 		CorrelationID: correlationID,
 		CausationID:   causationID,
 		OccurredAt:    occurredAt.UTC(),
@@ -36,63 +85,55 @@ func NewEnvelope(eventID, eventType, aggregateID, correlationID, causationID str
 }
 
 func WagerProcessed(eventID string, tx *wager.Transaction, correlationID string, now time.Time) Envelope {
-	data := map[string]any{
-		"transactionId": string(tx.ID()),
-		"kind":          string(tx.Kind()),
-		"status":        string(tx.Status()),
-		"walletId":      string(tx.WalletID()),
-		"playerId":      string(tx.PlayerID()),
-		"money":         moneyDTO(tx.Amount()),
+	data := WagerProcessedData{
+		TransactionID: string(tx.ID()),
+		Kind:          string(tx.Kind()),
+		Status:        string(tx.Status()),
+		WalletID:      string(tx.WalletID()),
+		PlayerID:      string(tx.PlayerID()),
+		Money:         moneyAmount(tx.Amount()),
 	}
 	if tx.Origin() == wager.OriginExternal {
-		data["providerId"] = tx.ProviderID()
-		data["externalTransactionId"] = tx.ExternalTransactionID()
-		data["roundId"] = tx.RoundID()
-		data["gameId"] = tx.GameID()
+		data.ProviderID = tx.ProviderID()
+		data.ExternalTransactionID = tx.ExternalTransactionID()
+		data.RoundID = tx.RoundID()
+		data.GameID = tx.GameID()
 	}
-	return NewEnvelope(eventID, "WagerTransactionProcessed", string(tx.ID()), correlationID, "", now, data)
+	return newEnvelope(eventID, "WagerTransactionProcessed", string(tx.ID()), string(tx.WalletID()), correlationID, "", now, data)
 }
 
 func WagerRejected(eventID string, tx *wager.Transaction, correlationID string, now time.Time) Envelope {
-	data := map[string]any{
-		"transactionId": string(tx.ID()),
-		"kind":          string(tx.Kind()),
-		"failureCode":   string(tx.FailureCode()),
-		"walletId":      string(tx.WalletID()),
+	data := WagerRejectedData{
+		TransactionID: string(tx.ID()),
+		Kind:          string(tx.Kind()),
+		FailureCode:   string(tx.FailureCode()),
+		WalletID:      string(tx.WalletID()),
 	}
 	if tx.Origin() == wager.OriginExternal {
-		data["providerId"] = tx.ProviderID()
-		data["externalTransactionId"] = tx.ExternalTransactionID()
+		data.ProviderID = tx.ProviderID()
+		data.ExternalTransactionID = tx.ExternalTransactionID()
 	}
-	return NewEnvelope(eventID, "WagerTransactionRejected", string(tx.ID()), correlationID, "", now, data)
+	return newEnvelope(eventID, "WagerTransactionRejected", string(tx.ID()), string(tx.WalletID()), correlationID, "", now, data)
 }
 
 func PendingReference(eventID string, tx *wager.Transaction, correlationID string, now time.Time) Envelope {
-	return NewEnvelope(eventID, "WagerTransactionPendingReference", string(tx.ID()), correlationID, "", now, map[string]any{
-		"transactionId":                  string(tx.ID()),
-		"providerId":                     tx.ProviderID(),
-		"referenceExternalTransactionId": tx.ReferenceExternalID(),
-		"attemptCount":                   tx.AttemptCount(),
+	return newEnvelope(eventID, "WagerTransactionPendingReference", string(tx.ID()), string(tx.WalletID()), correlationID, "", now, PendingReferenceData{
+		TransactionID:       string(tx.ID()),
+		ProviderID:          tx.ProviderID(),
+		ReferenceExternalID: tx.ReferenceExternalID(),
+		AttemptCount:        tx.AttemptCount(),
 	})
 }
 
 func BalanceChanged(eventID string, entry *ledger.Entry, txID wager.ID, walletVersion int64, correlationID string, now time.Time) Envelope {
-	return NewEnvelope(eventID, "WalletBalanceChanged", string(entry.WalletID()), correlationID, string(txID), now, map[string]any{
-		"walletId":      string(entry.WalletID()),
-		"transactionId": string(txID),
-		"direction":     string(entry.Direction()),
-		"money":         moneyDTO(entry.Amount()),
-		"balanceBefore": moneyDTO(entry.BalanceBefore()),
-		"balanceAfter":  moneyDTO(entry.BalanceAfter()),
-		"walletVersion": walletVersion,
+	wid := string(entry.WalletID())
+	return newEnvelope(eventID, "WalletBalanceChanged", wid, wid, correlationID, string(txID), now, BalanceChangedData{
+		WalletID:      wid,
+		TransactionID: string(txID),
+		Direction:     string(entry.Direction()),
+		Money:         moneyAmount(entry.Amount()),
+		BalanceBefore: moneyAmount(entry.BalanceBefore()),
+		BalanceAfter:  moneyAmount(entry.BalanceAfter()),
+		WalletVersion: walletVersion,
 	})
 }
-
-func moneyDTO(m money.Money) map[string]string {
-	return map[string]string{
-		"amount":   m.DecimalString(),
-		"currency": m.Currency(),
-	}
-}
-
-func WalletID(id wallet.ID) string { return string(id) }

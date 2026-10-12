@@ -10,6 +10,13 @@ import (
 	"junglegaming.io/finops-api/internal/domain/wager"
 )
 
+func TestParseKindOpening(t *testing.T) {
+	_, err := wager.ParseKind("OPENING")
+	if !errors.Is(err, domain.ErrOpeningNotAllowed) {
+		t.Fatalf("got %v", err)
+	}
+}
+
 func TestExternalOpeningRejected(t *testing.T) {
 	amt, _ := money.Parse("10.00", "BRL")
 	_, err := wager.NewExternal(wager.NewExternalParams{
@@ -43,6 +50,21 @@ func TestBetRequiresPositive(t *testing.T) {
 	})
 	if !errors.Is(err, domain.ErrInvalidAmount) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+func TestWinDoesNotRequireReference(t *testing.T) {
+	amt, _ := money.Parse("10.00", "BRL")
+	tx, err := wager.NewExternal(wager.NewExternalParams{
+		ID: "t1", Kind: wager.KindWin, WalletID: "w", PlayerID: "p", Amount: amt,
+		ProviderID: "a", ExternalTransactionID: "e", IdempotencyKey: "k", PayloadHash: "h",
+		RoundID: "r", GameID: "g", Now: time.Now(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tx.ReferenceExternalID() != "" {
+		t.Fatalf("unexpected ref %q", tx.ReferenceExternalID())
 	}
 }
 

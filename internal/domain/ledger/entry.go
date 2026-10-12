@@ -28,32 +28,33 @@ type Entry struct {
 	createdAt     time.Time
 }
 
+func (d Direction) apply(before, amount money.Money) (money.Money, error) {
+	switch d {
+	case Credit:
+		return before.Add(amount)
+	case Debit:
+		return before.Sub(amount)
+	default:
+		return money.Money{}, domain.ErrUninitialized
+	}
+}
+
 func New(id ID, walletID wallet.ID, transactionID string, direction Direction, amount, before, after money.Money, now time.Time) (*Entry, error) {
 	if id == "" || walletID == "" || transactionID == "" {
-		return nil, domain.ErrUninitialized
-	}
-	if direction != Debit && direction != Credit {
 		return nil, domain.ErrUninitialized
 	}
 	if !amount.IsPositive() {
 		return nil, domain.ErrInvalidAmount
 	}
-	var expected money.Money
-	var err error
-	switch direction {
-	case Credit:
-		expected, err = before.Add(amount)
-	case Debit:
-		expected, err = before.Sub(amount)
-	}
+	expected, err := direction.apply(before, amount)
 	if err != nil {
 		return nil, err
 	}
-	cmp, err := expected.Cmp(after)
+	eq, err := expected.Equal(after)
 	if err != nil {
 		return nil, err
 	}
-	if cmp != 0 {
+	if !eq {
 		return nil, domain.ErrLedgerInvariant
 	}
 	return &Entry{

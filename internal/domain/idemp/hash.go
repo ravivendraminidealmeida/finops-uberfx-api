@@ -4,82 +4,44 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
-	"sort"
 )
 
-func CanonicalHash(fields map[string]any) (string, error) {
-	canonical, err := canonicalize(fields)
+// Payload is the business snapshot hashed for idempotency.
+// Transport headers (Idempotency-Key, SQS messageId) are intentionally absent.
+type Payload struct {
+	ProviderID            string
+	ExternalTransactionID string
+	PlayerID              string
+	WalletID              string
+	RoundID               string
+	GameID                string
+	Kind                  string
+	Amount                string
+	Currency              string
+	ReferenceExternalID   string
+}
+
+func (p Payload) Hash() (string, error) {
+	fields := map[string]any{
+		"providerId":            p.ProviderID,
+		"externalTransactionId": p.ExternalTransactionID,
+		"playerId":              p.PlayerID,
+		"walletId":              p.WalletID,
+		"roundId":               p.RoundID,
+		"gameId":                p.GameID,
+		"kind":                  p.Kind,
+		"money": map[string]any{
+			"amount":   p.Amount,
+			"currency": p.Currency,
+		},
+	}
+	if p.ReferenceExternalID != "" {
+		fields["referenceExternalTransactionId"] = p.ReferenceExternalID
+	}
+	body, err := json.Marshal(fields)
 	if err != nil {
 		return "", err
 	}
-	sum := sha256.Sum256(canonical)
+	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:]), nil
-}
-
-func canonicalize(v any) ([]byte, error) {
-	switch val := v.(type) {
-	case map[string]any:
-		keys := make([]string, 0, len(val))
-		for k := range val {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		buf := []byte{'{'}
-		for i, k := range keys {
-			if i > 0 {
-				buf = append(buf, ',')
-			}
-			kb, _ := json.Marshal(k)
-			vb, err := canonicalize(val[k])
-			if err != nil {
-				return nil, err
-			}
-			buf = append(buf, kb...)
-			buf = append(buf, ':')
-			buf = append(buf, vb...)
-		}
-		buf = append(buf, '}')
-		return buf, nil
-	case []any:
-		buf := []byte{'['}
-		for i, item := range val {
-			if i > 0 {
-				buf = append(buf, ',')
-			}
-			ib, err := canonicalize(item)
-			if err != nil {
-				return nil, err
-			}
-			buf = append(buf, ib...)
-		}
-		buf = append(buf, ']')
-		return buf, nil
-	default:
-		b, err := json.Marshal(val)
-		if err != nil {
-			return nil, fmt.Errorf("canonicalize: %w", err)
-		}
-		return b, nil
-	}
-}
-
-func BusinessFields(providerID, externalID, playerID, walletID, roundID, gameID, kind, amount, currency, referenceExternalID string) map[string]any {
-	fields := map[string]any{
-		"providerId":            providerID,
-		"externalTransactionId": externalID,
-		"playerId":              playerID,
-		"walletId":              walletID,
-		"roundId":               roundID,
-		"gameId":                gameID,
-		"kind":                  kind,
-		"money": map[string]any{
-			"amount":   amount,
-			"currency": currency,
-		},
-	}
-	if referenceExternalID != "" {
-		fields["referenceExternalTransactionId"] = referenceExternalID
-	}
-	return fields
 }

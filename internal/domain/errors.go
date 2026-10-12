@@ -27,4 +27,5 @@ var (
 	ErrUninitialized             = errors.New("uninitialized domain value")
 	ErrLedgerInvariant           = errors.New("ledger invariant violated")
 	ErrPayloadConflict           = errors.New("payload hash mismatch")
+	ErrOverflow                  = errors.New("numeric overflow")
 )

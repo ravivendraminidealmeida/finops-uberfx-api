@@ -1,6 +1,7 @@
 package app
 
 import (
+	"junglegaming.io/finops-api/internal/domain/idemp"
 	"junglegaming.io/finops-api/internal/domain/money"
 	"junglegaming.io/finops-api/internal/domain/wager"
 	"junglegaming.io/finops-api/internal/domain/wallet"
@@ -23,10 +24,23 @@ type ProcessWagerCommand struct {
 	Kind                  wager.Kind
 	Amount                money.Money
 	ReferenceExternalID   string
-	PayloadHash           string
-	CorrelationID         string
 	AuthenticatedProvider string
 	Inbox                 *InboxMeta
+}
+
+func (cmd ProcessWagerCommand) payloadHash() (string, error) {
+	return idemp.Payload{
+		ProviderID:            cmd.ProviderID,
+		ExternalTransactionID: cmd.ExternalTransactionID,
+		PlayerID:              string(cmd.PlayerID),
+		WalletID:              string(cmd.WalletID),
+		RoundID:               cmd.RoundID,
+		GameID:                cmd.GameID,
+		Kind:                  string(cmd.Kind),
+		Amount:                cmd.Amount.DecimalString(),
+		Currency:              cmd.Amount.Currency(),
+		ReferenceExternalID:   cmd.ReferenceExternalID,
+	}.Hash()
 }
 
 type ProcessResult struct {
@@ -36,9 +50,8 @@ type ProcessResult struct {
 }
 
 type OpenWalletCommand struct {
-	PlayerID        wallet.PlayerID
-	Initial         money.Money
-	InternalService bool
+	PlayerID wallet.PlayerID
+	Initial  money.Money
 }
 
 type OpenWalletResult struct {

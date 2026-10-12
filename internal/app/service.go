@@ -2,9 +2,7 @@ package app
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 
 	"junglegaming.io/finops-api/internal/domain"
@@ -32,29 +30,21 @@ func NewService(uow UnitOfWork, clock Clock, ids IDGen, cfg Config) *Service {
 		cfg.MaxReferenceAttempts = 8
 	}
 	if cfg.ReferenceBackoff <= 0 {
-		cfg.ReferenceBackoff = time.Second
-	}
-	if clock == nil {
-		clock = SystemClock{}
-	}
-	if ids == nil {
-		ids = UUIDGen{}
+		cfg.ReferenceBackoff = 200 * time.Millisecond
 	}
 	return &Service{uow: uow, clock: clock, ids: ids, cfg: cfg}
 }
 
 func (s *Service) ProcessWager(ctx context.Context, cmd ProcessWagerCommand) (ProcessResult, error) {
-	if cmd.AuthenticatedProvider == "" {
-		return ProcessResult{}, domain.ErrUnauthorizedProvider
-	}
-	if cmd.AuthenticatedProvider != cmd.ProviderID {
+	if cmd.AuthenticatedProvider == "" || cmd.AuthenticatedProvider != cmd.ProviderID {
 		return ProcessResult{}, domain.ErrUnauthorizedProvider
 	}
 	if cmd.IdempotencyKey == "" {
 		return ProcessResult{}, domain.ErrInvalidIdempotencyKey
 	}
-	if cmd.Kind == wager.KindOpening {
-		return ProcessResult{}, domain.ErrOpeningNotAllowed
+	hash, err := cmd.payloadHash()
+	if err != nil {
+		return ProcessResult{}, err
 	}
 
 	tx, err := s.uow.Begin(ctx)
@@ -68,67 +58,45 @@ func (s *Service) ProcessWager(ctx context.Context, cmd ProcessWagerCommand) (Pr
 		if err != nil {
 			return ProcessResult{}, err
 		}
-		if !inserted {
-			if existingHash != cmd.Inbox.PayloadHash {
-				return ProcessResult{}, domain.ErrPayloadConflict
-			}
+		if !inserted && existingHash != cmd.Inbox.PayloadHash {
+			return ProcessResult{}, domain.ErrPayloadConflict
 		}
 	}
 
-	existing, err := tx.Wagers().GetByIdempotencyKey(ctx, cmd.IdempotencyKey)
-	if err != nil && !errors.Is(err, domain.ErrWalletNotFound) && !isNotFound(err) {
+	w, err := tx.Wallets().Lock(ctx, cmd.WalletID)
+	if err != nil {
+		return ProcessResult{}, err
+	}
+	if w.PlayerID() != cmd.PlayerID {
+		return ProcessResult{}, domain.ErrReferenceMismatch
+	}
+	if err := w.MustMatchCurrency(cmd.Amount); err != nil {
+		return ProcessResult{}, err
+	}
+
+	existing, err := tx.Wagers().GetByIdempotencyKey(ctx, cmd.ProviderID, cmd.IdempotencyKey)
+	if err != nil && !domain.IsNotFound(err) {
 		return ProcessResult{}, err
 	}
 	if existing != nil {
-		if existing.PayloadHash() != cmd.PayloadHash {
+		if existing.PayloadHash() != hash {
 			return ProcessResult{}, domain.ErrIdempotencyConflict
 		}
-		if existing.ProviderID() != cmd.AuthenticatedProvider {
-			return ProcessResult{}, domain.ErrUnauthorizedProvider
-		}
-		res, err := s.replay(existing)
-		if err != nil {
-			return ProcessResult{}, err
-		}
-		if err := s.completeInbox(ctx, tx, cmd); err != nil {
-			return ProcessResult{}, err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return ProcessResult{}, err
-		}
-		return res, nil
+		return s.commitReplay(ctx, tx, cmd, existing)
 	}
 
 	byExt, err := tx.Wagers().GetByExternalID(ctx, cmd.ProviderID, cmd.ExternalTransactionID)
-	if err != nil && !isNotFound(err) {
+	if err != nil && !domain.IsNotFound(err) {
 		return ProcessResult{}, err
 	}
 	if byExt != nil {
 		if byExt.IdempotencyKey() != cmd.IdempotencyKey {
 			return ProcessResult{}, domain.ErrExternalIDConflict
 		}
-		if byExt.PayloadHash() != cmd.PayloadHash {
+		if byExt.PayloadHash() != hash {
 			return ProcessResult{}, domain.ErrIdempotencyConflict
 		}
-		res, err := s.replay(byExt)
-		if err != nil {
-			return ProcessResult{}, err
-		}
-		if err := s.completeInbox(ctx, tx, cmd); err != nil {
-			return ProcessResult{}, err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return ProcessResult{}, err
-		}
-		return res, nil
-	}
-
-	w, err := tx.Wallets().Get(ctx, cmd.WalletID)
-	if err != nil {
-		return ProcessResult{}, err
-	}
-	if w.PlayerID() != cmd.PlayerID {
-		return ProcessResult{}, domain.ErrReferenceMismatch
+		return s.commitReplay(ctx, tx, cmd, byExt)
 	}
 
 	now := s.clock.Now()
@@ -141,7 +109,7 @@ func (s *Service) ProcessWager(ctx context.Context, cmd ProcessWagerCommand) (Pr
 		ProviderID:            cmd.ProviderID,
 		ExternalTransactionID: cmd.ExternalTransactionID,
 		IdempotencyKey:        cmd.IdempotencyKey,
-		PayloadHash:           cmd.PayloadHash,
+		PayloadHash:           hash,
 		RoundID:               cmd.RoundID,
 		GameID:                cmd.GameID,
 		ReferenceExternalID:   cmd.ReferenceExternalID,
@@ -152,49 +120,28 @@ func (s *Service) ProcessWager(ctx context.Context, cmd ProcessWagerCommand) (Pr
 	}
 
 	if err := s.applyOperation(ctx, tx, w, wt, now); err != nil {
-		if errors.Is(err, domain.ErrIdempotencyConflict) || errors.Is(err, domain.ErrExternalIDConflict) {
-			_ = tx.Rollback(ctx)
-			return s.lookupReplay(ctx, cmd)
-		}
-		if errors.Is(err, domain.ErrDuplicateReversal) {
-			_ = tx.Rollback(ctx)
-			return s.rejectDuplicate(ctx, cmd)
-		}
 		return ProcessResult{}, err
 	}
-
 	if err := s.completeInbox(ctx, tx, cmd); err != nil {
 		return ProcessResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ProcessResult{}, err
 	}
-
-	bal, _ := money.FromMinor(deref(wt.ResultBalanceMinor(), w.Balance().Minor()), w.Currency())
-	if wt.Status() == wager.StatusProcessed && wt.ResultBalanceMinor() != nil {
-		bal, _ = money.FromMinor(*wt.ResultBalanceMinor(), w.Currency())
-	} else {
-		fresh, err := s.GetWallet(ctx, cmd.WalletID)
-		if err == nil {
-			bal = fresh.Balance()
-		}
-	}
-	return ProcessResult{Transaction: wt, Balance: bal}, nil
+	return ProcessResult{Transaction: wt, Balance: processedBalance(wt, w.Balance())}, nil
 }
 
-func (s *Service) RetryPendingReferences(ctx context.Context, limit int) error {
-	tx, err := s.uow.Begin(ctx)
+func (s *Service) RetryPendingReferences(ctx context.Context, limit int) (int, error) {
+	var pending []*wager.Transaction
+	err := s.uow.Do(ctx, func(tx Tx) error {
+		var err error
+		pending, err = tx.Wagers().ListPendingReferences(ctx, s.clock.Now(), limit)
+		return err
+	})
 	if err != nil {
-		return err
+		return 0, err
 	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	pending, err := tx.Wagers().ListPendingReferences(ctx, s.clock.Now(), limit)
-	if err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
+	var first error
 	for _, p := range pending {
 		cmd := ProcessWagerCommand{
 			ProviderID:            p.ProviderID(),
@@ -207,15 +154,13 @@ func (s *Service) RetryPendingReferences(ctx context.Context, limit int) error {
 			Kind:                  p.Kind(),
 			Amount:                p.Amount(),
 			ReferenceExternalID:   p.ReferenceExternalID(),
-			PayloadHash:           p.PayloadHash(),
-			CorrelationID:         string(p.ID()),
 			AuthenticatedProvider: p.ProviderID(),
 		}
-		if _, err := s.resumePending(ctx, p, cmd); err != nil {
-			return err
+		if _, err := s.resumePending(ctx, p, cmd); err != nil && first == nil {
+			first = err
 		}
 	}
-	return nil
+	return len(pending), first
 }
 
 func (s *Service) resumePending(ctx context.Context, existing *wager.Transaction, cmd ProcessWagerCommand) (ProcessResult, error) {
@@ -230,84 +175,59 @@ func (s *Service) resumePending(ctx context.Context, existing *wager.Transaction
 		return ProcessResult{}, err
 	}
 	if current.Status() != wager.StatusPendingReference {
-		res, err := s.replay(current)
-		if err != nil {
-			return ProcessResult{}, err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return ProcessResult{}, err
-		}
-		return res, nil
+		return s.commitReplay(ctx, tx, cmd, current)
 	}
 
-	w, err := tx.Wallets().Get(ctx, current.WalletID())
+	w, err := tx.Wallets().Lock(ctx, current.WalletID())
 	if err != nil {
 		return ProcessResult{}, err
 	}
 	now := s.clock.Now()
-	if err := s.resolveAndApply(ctx, tx, w, current, now); err != nil {
+	if err := s.resolveAndApply(ctx, tx, w, current, now, false); err != nil {
 		return ProcessResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return ProcessResult{}, err
 	}
-	bal := w.Balance()
-	if current.ResultBalanceMinor() != nil {
-		bal, _ = money.FromMinor(*current.ResultBalanceMinor(), w.Currency())
-	}
-	return ProcessResult{Transaction: current, Balance: bal}, nil
+	return ProcessResult{Transaction: current, Balance: processedBalance(current, w.Balance())}, nil
 }
 
 func (s *Service) applyOperation(ctx context.Context, tx Tx, w *wallet.Wallet, wt *wager.Transaction, now time.Time) error {
-	if wt.Kind() == wager.KindRefund || wt.Kind() == wager.KindRollback {
-		return s.resolveAndApplyNew(ctx, tx, w, wt, now)
+	if wt.Kind().RequiresReference() || (wt.Kind().OptionalReference() && wt.ReferenceExternalID() != "") {
+		return s.resolveAndApply(ctx, tx, w, wt, now, true)
 	}
 	return s.applyResolved(ctx, tx, w, wt, nil, now, true)
 }
 
-func (s *Service) resolveAndApplyNew(ctx context.Context, tx Tx, w *wallet.Wallet, wt *wager.Transaction, now time.Time) error {
+func (s *Service) resolveAndApply(ctx context.Context, tx Tx, w *wallet.Wallet, wt *wager.Transaction, now time.Time, insert bool) error {
 	ref, err := tx.Wagers().LockByExternalID(ctx, wt.ProviderID(), wt.ReferenceExternalID())
-	if isNotFound(err) {
-		return s.parkReference(ctx, tx, w, wt, now, true)
+	if domain.IsNotFound(err) {
+		return s.parkReference(ctx, tx, w, wt, now, insert)
 	}
 	if err != nil {
 		return err
 	}
-	return s.applyWithReference(ctx, tx, w, wt, ref, now, true)
-}
-
-func (s *Service) resolveAndApply(ctx context.Context, tx Tx, w *wallet.Wallet, wt *wager.Transaction, now time.Time) error {
-	ref, err := tx.Wagers().LockByExternalID(ctx, wt.ProviderID(), wt.ReferenceExternalID())
-	if isNotFound(err) {
-		return s.parkReference(ctx, tx, w, wt, now, false)
-	}
-	if err != nil {
-		return err
-	}
-	return s.applyWithReference(ctx, tx, w, wt, ref, now, false)
+	return s.applyWithReference(ctx, tx, w, wt, ref, now, insert)
 }
 
 func (s *Service) parkReference(ctx context.Context, tx Tx, w *wallet.Wallet, wt *wager.Transaction, now time.Time, insert bool) error {
-	_ = w
+	wt.RememberBalance(w.Balance())
 	attempt := wt.AttemptCount() + 1
 	if attempt > s.cfg.MaxReferenceAttempts {
-		if err := wt.MarkRejected(wager.FailureReferenceNotFound, now); err != nil {
-			return err
-		}
-		if err := s.saveWager(ctx, tx, wt, insert); err != nil {
-			return err
-		}
-		return s.appendRejected(ctx, tx, wt, cmdCorrelation(wt), now)
+		return s.reject(ctx, tx, w, wt, wager.FailureReferenceNotFound, insert, now)
 	}
-	next := now.Add(s.cfg.ReferenceBackoff * time.Duration(1<<min(attempt-1, 10)))
+	exp := attempt - 1
+	if exp > 10 {
+		exp = 10
+	}
+	next := now.Add(s.cfg.ReferenceBackoff * time.Duration(1<<exp))
 	if err := wt.MarkPendingReference(attempt, next, now); err != nil {
 		return err
 	}
 	if err := s.saveWager(ctx, tx, wt, insert); err != nil {
 		return err
 	}
-	env := events.PendingReference(s.ids.New(), wt, cmdCorrelation(wt), now)
-	return s.appendOutbox(ctx, tx, env)
+	return s.appendOutbox(ctx, tx, events.PendingReference(s.ids.New(), wt, string(wt.ID()), now))
 }
 
 func (s *Service) applyWithReference(ctx context.Context, tx Tx, w *wallet.Wallet, wt *wager.Transaction, ref *wager.Transaction, now time.Time, insert bool) error {
@@ -315,71 +235,51 @@ func (s *Service) applyWithReference(ctx context.Context, tx Tx, w *wallet.Walle
 		if ref.Status() == wager.StatusPending || ref.Status() == wager.StatusPendingReference {
 			return s.parkReference(ctx, tx, w, wt, now, insert)
 		}
-		if err := wt.MarkRejected(wager.FailureReferenceNotProcessed, now); err != nil {
-			return err
-		}
-		if err := s.saveWager(ctx, tx, wt, insert); err != nil {
-			return err
-		}
-		return s.appendRejected(ctx, tx, wt, cmdCorrelation(wt), now)
+		return s.reject(ctx, tx, w, wt, wager.FailureReferenceNotProcessed, insert, now)
 	}
 	if ref.ProviderID() != wt.ProviderID() || ref.PlayerID() != wt.PlayerID() || ref.WalletID() != wt.WalletID() || ref.RoundID() != wt.RoundID() || ref.Amount().Currency() != wt.Amount().Currency() {
-		if err := wt.MarkRejected(wager.FailureReferenceMismatch, now); err != nil {
-			return err
-		}
-		if err := s.saveWager(ctx, tx, wt, insert); err != nil {
-			return err
-		}
-		return s.appendRejected(ctx, tx, wt, cmdCorrelation(wt), now)
+		return s.reject(ctx, tx, w, wt, wager.FailureReferenceMismatch, insert, now)
 	}
-	cmp, err := ref.Amount().Cmp(wt.Amount())
-	if err != nil || cmp != 0 {
-		if err := wt.MarkRejected(wager.FailureInvalidAmount, now); err != nil {
-			return err
-		}
-		if err := s.saveWager(ctx, tx, wt, insert); err != nil {
-			return err
-		}
-		return s.appendRejected(ctx, tx, wt, cmdCorrelation(wt), now)
+	if wt.Kind() == wager.KindWin && ref.Kind() != wager.KindBet {
+		return s.reject(ctx, tx, w, wt, wager.FailureReferenceMismatch, insert, now)
 	}
 	if wt.Kind() == wager.KindRefund && ref.Kind() != wager.KindBet {
-		if err := wt.MarkRejected(wager.FailureReferenceMismatch, now); err != nil {
-			return err
-		}
-		if err := s.saveWager(ctx, tx, wt, insert); err != nil {
-			return err
-		}
-		return s.appendRejected(ctx, tx, wt, cmdCorrelation(wt), now)
+		return s.reject(ctx, tx, w, wt, wager.FailureReferenceMismatch, insert, now)
 	}
 	if wt.Kind() == wager.KindRollback && ref.Kind() != wager.KindBet && ref.Kind() != wager.KindWin && ref.Kind() != wager.KindRefund {
-		if err := wt.MarkRejected(wager.FailureReferenceMismatch, now); err != nil {
-			return err
-		}
-		if err := s.saveWager(ctx, tx, wt, insert); err != nil {
-			return err
-		}
-		return s.appendRejected(ctx, tx, wt, cmdCorrelation(wt), now)
+		return s.reject(ctx, tx, w, wt, wager.FailureReferenceMismatch, insert, now)
 	}
-	dup, err := tx.Wagers().HasActiveReversal(ctx, ref.ID(), wt.Kind(), wt.ID())
-	if err != nil {
-		return err
-	}
-	if dup {
-		if err := wt.MarkRejected(wager.FailureDuplicateReversal, now); err != nil {
+	if !wt.Kind().OptionalReference() {
+		eq, err := ref.Amount().Equal(wt.Amount())
+		if err != nil || !eq {
+			return s.reject(ctx, tx, w, wt, wager.FailureInvalidAmount, insert, now)
+		}
+		dup, err := tx.Wagers().HasActiveReversal(ctx, ref.ID(), wt.ID())
+		if err != nil {
 			return err
 		}
-		if err := s.saveWager(ctx, tx, wt, insert); err != nil {
-			return err
+		if dup {
+			return s.reject(ctx, tx, w, wt, wager.FailureDuplicateReversal, insert, now)
 		}
-		return s.appendRejected(ctx, tx, wt, cmdCorrelation(wt), now)
 	}
 	wt.SetReferenced(ref.ID())
 	return s.applyResolved(ctx, tx, w, wt, ref, now, insert)
 }
 
-func (s *Service) applyResolved(ctx context.Context, tx Tx, w *wallet.Wallet, wt *wager.Transaction, ref *wager.Transaction, now time.Time, insert bool) error {
-	corr := cmdCorrelation(wt)
+func (s *Service) reject(ctx context.Context, tx Tx, w *wallet.Wallet, wt *wager.Transaction, code wager.FailureCode, insert bool, now time.Time) error {
+	if w != nil {
+		wt.RememberBalance(w.Balance())
+	}
+	if err := wt.MarkRejected(code, now); err != nil {
+		return err
+	}
+	if err := s.saveWager(ctx, tx, wt, insert); err != nil {
+		return err
+	}
+	return s.appendOutbox(ctx, tx, events.WagerRejected(s.ids.New(), wt, string(wt.ID()), now))
+}
 
+func (s *Service) applyResolved(ctx context.Context, tx Tx, w *wallet.Wallet, wt *wager.Transaction, ref *wager.Transaction, now time.Time, insert bool) error {
 	if wt.Kind() == wager.KindLoss {
 		if err := wt.MarkProcessed(w.Balance(), "", now); err != nil {
 			return err
@@ -387,53 +287,41 @@ func (s *Service) applyResolved(ctx context.Context, tx Tx, w *wallet.Wallet, wt
 		if err := s.saveWager(ctx, tx, wt, insert); err != nil {
 			return err
 		}
-		return s.appendProcessed(ctx, tx, wt, nil, w.Version(), corr, now)
+		return s.appendProcessed(ctx, tx, wt, nil, w.Version(), now)
 	}
 
-	debit := false
-	switch wt.Kind() {
-	case wager.KindBet:
-		debit = true
-	case wager.KindWin, wager.KindRefund:
-		debit = false
-	case wager.KindRollback:
-		if ref == nil {
-			return domain.ErrReferenceNotFound
-		}
-		switch ref.Kind() {
-		case wager.KindBet:
-			debit = false
-		case wager.KindWin, wager.KindRefund:
-			debit = true
-		}
+	refKind := wager.Kind("")
+	if ref != nil {
+		refKind = ref.Kind()
+	}
+	debit := wt.Kind().DebitsPlayer(refKind)
+	if wt.Kind() == wager.KindRollback && ref == nil {
+		return domain.ErrReferenceNotFound
 	}
 
+	expected := w.Version()
 	var before, after money.Money
-	var version int64
 	var err error
 	if debit {
-		before, after, version, err = tx.Wallets().ApplyDebit(ctx, w.ID(), wt.Amount(), now)
+		before, after, err = w.Debit(wt.Amount(), now)
 		if errors.Is(err, domain.ErrInsufficientFunds) {
 			code := wager.FailureInsufficientFunds
 			if wt.Kind() == wager.KindRollback {
 				code = wager.FailureInsufficientFundsReversal
 			}
-			if err := wt.MarkRejected(code, now); err != nil {
-				return err
-			}
-			if err := s.saveWager(ctx, tx, wt, insert); err != nil {
-				return err
-			}
-			return s.appendRejected(ctx, tx, wt, corr, now)
+			return s.reject(ctx, tx, w, wt, code, insert, now)
 		}
 		if err != nil {
 			return err
 		}
 	} else {
-		before, after, version, err = tx.Wallets().ApplyCredit(ctx, w.ID(), wt.Amount(), now)
+		before, after, err = w.Credit(wt.Amount(), now)
 		if err != nil {
 			return err
 		}
+	}
+	if err := tx.Wallets().Save(ctx, w, expected); err != nil {
+		return err
 	}
 
 	dir := ledger.Credit
@@ -453,17 +341,18 @@ func (s *Service) applyResolved(ctx context.Context, tx Tx, w *wallet.Wallet, wt
 	if err := tx.Ledger().Insert(ctx, entry); err != nil {
 		return err
 	}
-	return s.appendProcessed(ctx, tx, wt, entry, version, corr, now)
+	return s.appendProcessed(ctx, tx, wt, entry, w.Version(), now)
 }
 
 func (s *Service) saveWager(ctx context.Context, tx Tx, wt *wager.Transaction, insert bool) error {
 	if insert {
-		return mapInsertErr(tx.Wagers().Insert(ctx, wt))
+		return tx.Wagers().Insert(ctx, wt)
 	}
 	return tx.Wagers().Update(ctx, wt)
 }
 
-func (s *Service) appendProcessed(ctx context.Context, tx Tx, wt *wager.Transaction, entry *ledger.Entry, walletVersion int64, corr string, now time.Time) error {
+func (s *Service) appendProcessed(ctx context.Context, tx Tx, wt *wager.Transaction, entry *ledger.Entry, walletVersion int64, now time.Time) error {
+	corr := string(wt.ID())
 	if err := s.appendOutbox(ctx, tx, events.WagerProcessed(s.ids.New(), wt, corr, now)); err != nil {
 		return err
 	}
@@ -473,21 +362,14 @@ func (s *Service) appendProcessed(ctx context.Context, tx Tx, wt *wager.Transact
 	return nil
 }
 
-func (s *Service) appendRejected(ctx context.Context, tx Tx, wt *wager.Transaction, corr string, now time.Time) error {
-	return s.appendOutbox(ctx, tx, events.WagerRejected(s.ids.New(), wt, corr, now))
-}
-
 func (s *Service) appendOutbox(ctx context.Context, tx Tx, env events.Envelope) error {
-	payload, err := json.Marshal(env)
-	if err != nil {
-		return err
-	}
 	return tx.Outbox().Insert(ctx, OutboxRecord{
 		ID:          s.ids.New(),
 		EventID:     env.EventID,
 		EventType:   env.EventType,
 		AggregateID: env.AggregateID,
-		Payload:     payload,
+		GroupID:     env.GroupID,
+		Envelope:    env,
 		OccurredAt:  env.OccurredAt,
 		NextAttempt: env.OccurredAt,
 	})
@@ -500,25 +382,7 @@ func (s *Service) completeInbox(ctx context.Context, tx Tx, cmd ProcessWagerComm
 	return tx.Inbox().Complete(ctx, cmd.Inbox.ConsumerName, cmd.Inbox.MessageID, s.clock.Now())
 }
 
-func (s *Service) lookupReplay(ctx context.Context, cmd ProcessWagerCommand) (ProcessResult, error) {
-	tx, err := s.uow.Begin(ctx)
-	if err != nil {
-		return ProcessResult{}, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	existing, err := tx.Wagers().GetByIdempotencyKey(ctx, cmd.IdempotencyKey)
-	if isNotFound(err) {
-		existing, err = tx.Wagers().GetByExternalID(ctx, cmd.ProviderID, cmd.ExternalTransactionID)
-	}
-	if err != nil {
-		return ProcessResult{}, err
-	}
-	if existing.PayloadHash() != cmd.PayloadHash {
-		return ProcessResult{}, domain.ErrIdempotencyConflict
-	}
-	if existing.IdempotencyKey() != cmd.IdempotencyKey {
-		return ProcessResult{}, domain.ErrExternalIDConflict
-	}
+func (s *Service) commitReplay(ctx context.Context, tx Tx, cmd ProcessWagerCommand, existing *wager.Transaction) (ProcessResult, error) {
 	res, err := s.replay(existing)
 	if err != nil {
 		return ProcessResult{}, err
@@ -532,32 +396,18 @@ func (s *Service) lookupReplay(ctx context.Context, cmd ProcessWagerCommand) (Pr
 	return res, nil
 }
 
-func (s *Service) rejectDuplicate(ctx context.Context, cmd ProcessWagerCommand) (ProcessResult, error) {
-	return ProcessResult{}, domain.ErrDuplicateReversal
-}
-
 func (s *Service) replay(existing *wager.Transaction) (ProcessResult, error) {
 	if existing.ProviderID() == "" && existing.Origin() == wager.OriginExternal {
 		return ProcessResult{}, domain.ErrUnauthorizedProvider
 	}
-	cur := existing.Amount().Currency()
-	var bal money.Money
-	if existing.ResultBalanceMinor() != nil {
-		var err error
-		bal, err = money.FromMinor(*existing.ResultBalanceMinor(), cur)
-		if err != nil {
-			return ProcessResult{}, err
-		}
-	} else {
-		bal, _ = money.Zero(cur)
+	zero, err := money.Zero(existing.Amount().Currency())
+	if err != nil {
+		return ProcessResult{}, err
 	}
-	return ProcessResult{Transaction: existing, Balance: bal, IdempotentReplay: true}, nil
+	return ProcessResult{Transaction: existing, Balance: processedBalance(existing, zero), IdempotentReplay: true}, nil
 }
 
 func (s *Service) OpenWallet(ctx context.Context, cmd OpenWalletCommand) (OpenWalletResult, error) {
-	if !cmd.InternalService {
-		return OpenWalletResult{}, domain.ErrUnauthorizedInternal
-	}
 	now := s.clock.Now()
 	w, err := wallet.New(wallet.ID(s.ids.New()), cmd.PlayerID, cmd.Initial, now)
 	if err != nil {
@@ -590,7 +440,7 @@ func (s *Service) OpenWallet(ctx context.Context, cmd OpenWalletCommand) (OpenWa
 		if err := tx.Ledger().Insert(ctx, entry); err != nil {
 			return OpenWalletResult{}, err
 		}
-		if err := s.appendProcessed(ctx, tx, opening, entry, w.Version(), string(opening.ID()), now); err != nil {
+		if err := s.appendProcessed(ctx, tx, opening, entry, w.Version(), now); err != nil {
 			return OpenWalletResult{}, err
 		}
 	}
@@ -601,80 +451,56 @@ func (s *Service) OpenWallet(ctx context.Context, cmd OpenWalletCommand) (OpenWa
 }
 
 func (s *Service) GetWallet(ctx context.Context, id wallet.ID) (*wallet.Wallet, error) {
-	tx, err := s.uow.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	w, err := tx.Wallets().Get(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return w, nil
+	var w *wallet.Wallet
+	err := s.uow.Do(ctx, func(tx Tx) error {
+		var err error
+		w, err = tx.Wallets().Get(ctx, id)
+		return err
+	})
+	return w, err
 }
 
 func (s *Service) GetTransaction(ctx context.Context, id wager.ID, provider string, internal bool) (*wager.Transaction, error) {
-	tx, err := s.uow.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	wt, err := tx.Wagers().Get(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if err := authorizeRead(wt, provider, internal); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return wt, nil
+	var wt *wager.Transaction
+	err := s.uow.Do(ctx, func(tx Tx) error {
+		var err error
+		wt, err = tx.Wagers().Get(ctx, id)
+		if err != nil {
+			return err
+		}
+		return authorizeRead(wt, provider, internal)
+	})
+	return wt, err
 }
 
 func (s *Service) GetByExternal(ctx context.Context, providerID, externalID, authProvider string) (*wager.Transaction, error) {
 	if authProvider != providerID {
 		return nil, domain.ErrUnauthorizedProvider
 	}
-	tx, err := s.uow.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	wt, err := tx.Wagers().GetByExternalID(ctx, providerID, externalID)
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return wt, nil
+	var wt *wager.Transaction
+	err := s.uow.Do(ctx, func(tx Tx) error {
+		var err error
+		wt, err = tx.Wagers().GetByExternalID(ctx, providerID, externalID)
+		return err
+	})
+	return wt, err
 }
 
 func (s *Service) ListLedger(ctx context.Context, walletID wallet.ID, after time.Time, afterID string, limit int) ([]*ledger.Entry, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	tx, err := s.uow.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	items, err := tx.Ledger().ListByWallet(ctx, walletID, after, afterID, limit)
-	if err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return items, nil
+	var items []*ledger.Entry
+	err := s.uow.Do(ctx, func(tx Tx) error {
+		var err error
+		items, err = tx.Ledger().ListByWallet(ctx, walletID, after, afterID, limit)
+		return err
+	})
+	return items, err
 }
 
 func (s *Service) Reconcile(ctx context.Context, walletID wallet.ID) (ReconcileResult, error) {
-	tx, err := s.uow.Begin(ctx)
+	tx, err := s.uow.BeginSnapshot(ctx)
 	if err != nil {
 		return ReconcileResult{}, err
 	}
@@ -699,7 +525,7 @@ func (s *Service) Reconcile(ctx context.Context, walletID wallet.ID) (ReconcileR
 	if err != nil {
 		return ReconcileResult{}, err
 	}
-	cmp, err := w.Balance().Cmp(calc)
+	eq, err := w.Balance().Equal(calc)
 	if err != nil {
 		return ReconcileResult{}, err
 	}
@@ -708,7 +534,7 @@ func (s *Service) Reconcile(ctx context.Context, walletID wallet.ID) (ReconcileR
 		StoredBalance:     w.Balance(),
 		CalculatedBalance: calc,
 		Difference:        diff,
-		Consistent:        cmp == 0,
+		Consistent:        eq,
 		CheckedEntries:    count,
 	}, nil
 }
@@ -726,38 +552,9 @@ func authorizeRead(wt *wager.Transaction, provider string, internal bool) error 
 	return nil
 }
 
-func isNotFound(err error) bool {
-	return errors.Is(err, domain.ErrWalletNotFound) || errors.Is(err, domain.ErrTransactionNotFound)
-}
-
-func mapInsertErr(err error) error {
-	if err == nil {
-		return nil
+func processedBalance(wt *wager.Transaction, fallback money.Money) money.Money {
+	if bal, ok := wt.ResultBalance(); ok {
+		return bal
 	}
-	if errors.Is(err, domain.ErrIdempotencyConflict) || errors.Is(err, domain.ErrDuplicateReversal) || errors.Is(err, domain.ErrExternalIDConflict) || errors.Is(err, domain.ErrWalletConflict) {
-		return err
-	}
-	return err
-}
-
-func deref(v *int64, fallback int64) int64 {
-	if v == nil {
-		return fallback
-	}
-	return *v
-}
-
-func cmdCorrelation(wt *wager.Transaction) string {
-	return string(wt.ID())
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func FormatError(err error) string {
-	return fmt.Sprintf("%v", err)
+	return fallback
 }

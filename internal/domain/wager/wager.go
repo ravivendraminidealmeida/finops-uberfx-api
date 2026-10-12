@@ -53,12 +53,12 @@ type Transaction struct {
 	referenceExternalID   string
 	referencedInternalID  ID
 	failureCode           FailureCode
-	resultBalanceMinor    *int64
+	resultBalance         money.Money
 	attemptCount          int
-	nextAttemptAt         *time.Time
+	nextAttemptAt         time.Time
 	createdAt             time.Time
 	updatedAt             time.Time
-	processedAt           *time.Time
+	processedAt           time.Time
 }
 
 type NewExternalParams struct {
@@ -78,11 +78,11 @@ type NewExternalParams struct {
 }
 
 func NewExternal(p NewExternalParams) (*Transaction, error) {
-	if p.ID == "" || p.WalletID == "" || p.PlayerID == "" || p.ProviderID == "" || p.ExternalTransactionID == "" {
-		return nil, domain.ErrUninitialized
-	}
-	if p.IdempotencyKey == "" || p.PayloadHash == "" || p.RoundID == "" || p.GameID == "" {
-		return nil, domain.ErrUninitialized
+	if err := requireNonEmpty(
+		string(p.ID), string(p.WalletID), string(p.PlayerID),
+		p.ProviderID, p.ExternalTransactionID, p.IdempotencyKey, p.PayloadHash, p.RoundID, p.GameID,
+	); err != nil {
+		return nil, err
 	}
 	if !p.Amount.Initialized() {
 		return nil, domain.ErrUninitialized
@@ -90,10 +90,13 @@ func NewExternal(p NewExternalParams) (*Transaction, error) {
 	if p.Kind == KindOpening {
 		return nil, domain.ErrOpeningNotAllowed
 	}
+	if !p.Kind.ValidExternal() {
+		return nil, domain.ErrInvalidKind
+	}
 	if err := validateExternalAmount(p.Kind, p.Amount); err != nil {
 		return nil, err
 	}
-	if (p.Kind == KindRefund || p.Kind == KindRollback) && p.ReferenceExternalID == "" {
+	if p.Kind.RequiresReference() && p.ReferenceExternalID == "" {
 		return nil, domain.ErrReferenceRequired
 	}
 	now := p.Now.UTC()
@@ -118,35 +121,29 @@ func NewExternal(p NewExternalParams) (*Transaction, error) {
 }
 
 func NewOpening(id ID, walletID wallet.ID, playerID wallet.PlayerID, amount money.Money, now time.Time) (*Transaction, error) {
-	if id == "" || walletID == "" || playerID == "" || !amount.Initialized() {
+	if err := requireNonEmpty(string(id), string(walletID), string(playerID)); err != nil {
+		return nil, err
+	}
+	if !amount.Initialized() {
 		return nil, domain.ErrUninitialized
 	}
 	if !amount.IsPositive() {
 		return nil, domain.ErrInvalidAmount
 	}
 	t := now.UTC()
-	processed := t
-	minor := amount.Minor()
 	return &Transaction{
-		id:                 id,
-		origin:             OriginInternal,
-		kind:               KindOpening,
-		status:             StatusProcessed,
-		walletID:           walletID,
-		playerID:           playerID,
-		amount:             amount,
-		resultBalanceMinor: &minor,
-		createdAt:          t,
-		updatedAt:          t,
-		processedAt:        &processed,
+		id:            id,
+		origin:        OriginInternal,
+		kind:          KindOpening,
+		status:        StatusProcessed,
+		walletID:      walletID,
+		playerID:      playerID,
+		amount:        amount,
+		resultBalance: amount,
+		createdAt:     t,
+		updatedAt:     t,
+		processedAt:   t,
 	}, nil
-}
-
-func Rehydrate(t Transaction) (*Transaction, error) {
-	if t.id == "" || t.walletID == "" || t.playerID == "" || !t.amount.Initialized() {
-		return nil, domain.ErrUninitialized
-	}
-	return &t, nil
 }
 
 func validateExternalAmount(kind Kind, amount money.Money) error {
@@ -161,6 +158,15 @@ func validateExternalAmount(kind Kind, amount money.Money) error {
 		}
 	default:
 		return domain.ErrInvalidKind
+	}
+	return nil
+}
+
+func requireNonEmpty(vals ...string) error {
+	for _, v := range vals {
+		if v == "" {
+			return domain.ErrUninitialized
+		}
 	}
 	return nil
 }
@@ -181,72 +187,61 @@ func (t *Transaction) GameID() string                { return t.gameID }
 func (t *Transaction) ReferenceExternalID() string   { return t.referenceExternalID }
 func (t *Transaction) ReferencedInternalID() ID      { return t.referencedInternalID }
 func (t *Transaction) FailureCode() FailureCode      { return t.failureCode }
-func (t *Transaction) ResultBalanceMinor() *int64    { return t.resultBalanceMinor }
 func (t *Transaction) AttemptCount() int             { return t.attemptCount }
-func (t *Transaction) NextAttemptAt() *time.Time     { return t.nextAttemptAt }
+func (t *Transaction) NextAttemptAt() time.Time      { return t.nextAttemptAt }
 func (t *Transaction) CreatedAt() time.Time          { return t.createdAt }
 func (t *Transaction) UpdatedAt() time.Time          { return t.updatedAt }
-func (t *Transaction) ProcessedAt() *time.Time       { return t.processedAt }
+func (t *Transaction) ProcessedAt() time.Time        { return t.processedAt }
+
+func (t *Transaction) ResultBalance() (money.Money, bool) {
+	return t.resultBalance, t.resultBalance.Initialized()
+}
 
 func (t *Transaction) IsTerminal() bool {
-	return t.status == StatusProcessed || t.status == StatusRejected || t.status == StatusFailed
-}
-
-func (t *Transaction) MovesMoney() bool {
-	switch t.kind {
-	case KindBet, KindWin, KindRefund, KindRollback, KindOpening:
+	switch t.status {
+	case StatusProcessed, StatusRejected, StatusFailed:
 		return true
 	default:
 		return false
 	}
 }
 
-func (t *Transaction) DebitDirection() bool {
-	switch t.kind {
-	case KindBet:
-		return true
-	case KindRollback:
-		return t.referencedWasCredit()
-	default:
-		return false
-	}
-}
-
-func (t *Transaction) referencedWasCredit() bool {
-	return false
-}
-
-func (t *Transaction) MarkProcessed(balance money.Money, referenced ID, now time.Time) error {
+func (t *Transaction) requireOpen() error {
 	if t.IsTerminal() {
 		return domain.ErrTerminalTransaction
 	}
-	if t.status != StatusPending && t.status != StatusPendingReference {
+	switch t.status {
+	case StatusPending, StatusPendingReference:
+		return nil
+	default:
 		return domain.ErrInvalidStateTransition
 	}
-	t.status = StatusProcessed
-	t.referencedInternalID = referenced
-	minor := balance.Minor()
-	t.resultBalanceMinor = &minor
+}
+
+func (t *Transaction) finish(status Status, now time.Time) {
 	ts := now.UTC()
-	t.processedAt = &ts
+	t.status = status
 	t.updatedAt = ts
-	t.nextAttemptAt = nil
+	t.processedAt = ts
+	t.nextAttemptAt = time.Time{}
+}
+
+func (t *Transaction) MarkProcessed(balance money.Money, referenced ID, now time.Time) error {
+	if err := t.requireOpen(); err != nil {
+		return err
+	}
+	t.referencedInternalID = referenced
+	t.resultBalance = balance
+	t.finish(StatusProcessed, now)
 	return nil
 }
 
 func (t *Transaction) MarkRejected(code FailureCode, now time.Time) error {
-	if t.IsTerminal() {
-		return domain.ErrTerminalTransaction
+	if err := t.requireOpen(); err != nil {
+		return err
 	}
-	if t.status != StatusPending && t.status != StatusPendingReference {
-		return domain.ErrInvalidStateTransition
-	}
-	t.status = StatusRejected
 	t.failureCode = code
-	ts := now.UTC()
-	t.updatedAt = ts
-	t.processedAt = &ts
-	t.nextAttemptAt = nil
+	t.finish(StatusRejected, now)
 	return nil
 }
 
@@ -254,26 +249,18 @@ func (t *Transaction) MarkFailed(code FailureCode, now time.Time) error {
 	if t.IsTerminal() {
 		return domain.ErrTerminalTransaction
 	}
-	t.status = StatusFailed
 	t.failureCode = code
-	ts := now.UTC()
-	t.updatedAt = ts
-	t.processedAt = &ts
-	t.nextAttemptAt = nil
+	t.finish(StatusFailed, now)
 	return nil
 }
 
 func (t *Transaction) MarkPendingReference(attempt int, next time.Time, now time.Time) error {
-	if t.IsTerminal() {
-		return domain.ErrTerminalTransaction
-	}
-	if t.status != StatusPending && t.status != StatusPendingReference {
-		return domain.ErrInvalidStateTransition
+	if err := t.requireOpen(); err != nil {
+		return err
 	}
 	t.status = StatusPendingReference
 	t.attemptCount = attempt
-	n := next.UTC()
-	t.nextAttemptAt = &n
+	t.nextAttemptAt = next.UTC()
 	t.updatedAt = now.UTC()
 	return nil
 }
@@ -282,12 +269,8 @@ func (t *Transaction) SetReferenced(id ID) {
 	t.referencedInternalID = id
 }
 
-func ParseKind(s string) (Kind, error) {
-	k := Kind(s)
-	switch k {
-	case KindOpening, KindBet, KindWin, KindLoss, KindRefund, KindRollback:
-		return k, nil
-	default:
-		return "", domain.ErrInvalidKind
+func (t *Transaction) RememberBalance(m money.Money) {
+	if m.Initialized() {
+		t.resultBalance = m
 	}
 }
